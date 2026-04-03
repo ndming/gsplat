@@ -374,15 +374,15 @@ def fully_fused_projection(
         - **indptr**. CSR-style index pointer into gaussian_ids for batch-camera pairs. Int32 tensor of shape [B*C+1].
         - **radii**. The maximum radius of the projected Gaussians in pixel unit. Int32 tensor of shape [nnz, 2].
         - **means**. Projected Gaussian means in 2D. [nnz, 2]
-        - **depths**. The z-depth of the projected Gaussians. [nnz]
+        - **means_c**. Transformed Gaussians in camera space. [nnz, 3]
         - **conics**. Inverse of the projected covariances. Return the flattend upper triangle with [nnz, 3]
         - **compensations**. The view-dependent opacity compensation factor. [nnz]
 
         If `packed` is False:
 
         - **radii**. The maximum radius of the projected Gaussians in pixel unit. Int32 tensor of shape [..., C, N, 2].
-        - **means**. Projected Gaussian means in 2D. [..., C, N, 2]
-        - **depths**. The z-depth of the projected Gaussians. [..., C, N]
+        - **means2d**. Projected Gaussian means in 2D. [..., C, N, 2]
+        - **means_c**. Transformed Gaussians in camera space. [..., C, N, 3]
         - **conics**. Inverse of the projected covariances. Return the flattend upper triangle with [..., C, N, 3]
         - **compensations**. The view-dependent opacity compensation factor. [..., C, N]
     """
@@ -1074,7 +1074,7 @@ class _FullyFusedProjection(torch.autograd.Function):
         )
 
         # "covars" and {"quats", "scales"} are mutually exclusive
-        radii, means2d, depths, conics, compensations = _make_lazy_cuda_func(
+        radii, means2d, means_c, conics, compensations = _make_lazy_cuda_func(
             "projection_ewa_3dgs_fused_fwd"
         )(
             means,
@@ -1103,10 +1103,10 @@ class _FullyFusedProjection(torch.autograd.Function):
         ctx.eps2d = eps2d
         ctx.camera_model_type = camera_model_type
 
-        return radii, means2d, depths, conics, compensations
+        return radii, means2d, means_c, conics, compensations
 
     @staticmethod
-    def backward(ctx, v_radii, v_means2d, v_depths, v_conics, v_compensations):
+    def backward(ctx, v_radii, v_means2d, v_means_c, v_conics, v_compensations):
         (
             means,
             covars,
@@ -1141,7 +1141,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             conics,
             compensations,
             v_means2d.contiguous(),
-            v_depths.contiguous(),
+            v_means_c.contiguous(),
             v_conics.contiguous(),
             v_compensations,
             ctx.needs_input_grad[4],  # viewmats_requires_grad

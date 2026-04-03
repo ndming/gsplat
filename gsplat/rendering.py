@@ -42,7 +42,7 @@ from .distributed import (
     all_to_all_int32,
     all_to_all_tensor_list,
 )
-from .utils import depth_to_normal, get_projection_matrix
+from .utils import depth_to_normal, get_projection_matrix, normalized_quat_to_rotmat
 
 
 def _compute_view_dirs_packed(
@@ -120,6 +120,28 @@ def _compute_view_dirs_packed(
     return dirs
 
 
+def _quats_scales_to_normals(q_raw: Tensor, s: Tensor) -> Tensor:
+    """Select the rotation matrix column corresponding to the minimum scale axis.
+    
+    Args:
+        q_raw: Quaternions (wxyz), not required to be normalized. [..., 4]
+        s:     Scale factors. [..., 3]
+    Returns:
+        normals: World-space unit normals. [..., 3]
+    """
+    min_axis_idx = torch.argmin(s, dim=-1, keepdim=True)  # [..., 1]
+    q = F.normalize(q_raw, dim=-1)                        # [..., 4]
+    w, x, y, z = q.unbind(dim=-1)                         # each [...]
+    x2, y2, z2 = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    col0 = torch.stack([1-2*(y2+z2),  2*(xy+wz),   2*(xz-wy)], dim=-1)   # [..., 3]
+    col1 = torch.stack([2*(xy-wz),    1-2*(x2+z2), 2*(yz+wx)], dim=-1)   # [..., 3]
+    col2 = torch.stack([2*(xz+wy),    2*(yz-wx),   1-2*(x2+y2)], dim=-1) # [..., 3]
+    return torch.where(min_axis_idx == 0, col0,
+           torch.where(min_axis_idx == 1, col1, col2))                   # [..., 3]
+
+
 def rasterization(
     means: Tensor,  # [..., N, 3]
     quats: Tensor,  # [..., N, 4]
@@ -138,7 +160,7 @@ def rasterization(
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
+    render_mode: Literal["RGB", "D", "ED", "PD", "RGB+D", "RGB+ED", "RGB+PD"] = "RGB",
     sparse_grad: bool = False,
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
@@ -191,10 +213,12 @@ def rasterization(
 
     .. note::
         **Depth Rendering**: This function supports colors or/and depths via `render_mode`.
-        The supported modes are "RGB", "D", "ED", "RGB+D", and "RGB+ED". "RGB" renders the
-        colored image that respects the `colors` argument. "D" renders the accumulated z-depth
-        :math:`\\sum_i w_i z_i`. "ED" renders the expected z-depth
-        :math:`\\frac{\\sum_i w_i z_i}{\\sum_i w_i}`. "RGB+D" and "RGB+ED" render both
+        The supported modes are "RGB", "D", "ED", "PD", "RGB+D", "RGB+ED", and "RGB+PD".
+        "RGB" renders the colored image that respects the `colors` argument. "D" renders
+        the accumulated z-depth :math:`\\sum_i w_i z_i`. "ED" renders the expected z-depth
+        :math:`\\frac{\\sum_i w_i z_i}{\\sum_i w_i}`. "PD" renders the plane depth as described
+        in `PGSR: Planar-based Gaussian Splatting for Efficient and High-Fidelity Surface Reconstruction
+        <https://arxiv.org/abs/2406.06521>`_. "RGB+D", "RGB+ED", and "RGB+PD" render both
         the colored image and the depth, in which the depth is the last channel of the output.
 
     .. note::
@@ -274,9 +298,9 @@ def rasterization(
         tile_size: The size of the tiles for rasterization. Default is 16.
             (Note: other values are not tested)
         backgrounds: The background colors. [..., C, D]. Default is None.
-        render_mode: The rendering mode. Supported modes are "RGB", "D", "ED", "RGB+D",
-            and "RGB+ED". "RGB" renders the colored image, "D" renders the accumulated depth, and
-            "ED" renders the expected depth. Default is "RGB".
+        render_mode: The rendering mode. Supported modes are "RGB", "D", "ED", "PD", "RGB+D", "RGB+ED",
+            and "RGB+PD". "RGB" renders the colored image, "D" renders the accumulated depth, "ED" renders
+            the expected depth, and "PD" renders the plane depth. Default is "RGB".
         sparse_grad: If true, the gradients for {means, quats, scales} will be stored in
             a COO sparse layout. This can be helpful for saving memory. Default is False.
         absgrad: If true, the absolute gradients of the projected 2D means
@@ -319,8 +343,8 @@ def rasterization(
 
         **render_colors**: The rendered colors. [..., C, height, width, X].
         X depends on the `render_mode` and input `colors`. If `render_mode` is "RGB",
-        X is D; if `render_mode` is "D" or "ED", X is 1; if `render_mode` is "RGB+D" or
-        "RGB+ED", X is D+1.
+        X is D; if `render_mode` is "D", "ED", or "PD", X is 1; if `render_mode` is "RGB+D",
+        "RGB+ED", or "RGB+PD", X is D+1.
 
         **render_alphas**: The rendered alphas. [..., C, height, width, 1].
 
@@ -348,7 +372,7 @@ def rasterization(
         >>> print (colors.shape, alphas.shape)
         torch.Size([1, 200, 300, 3]) torch.Size([1, 200, 300, 1])
         >>> print (meta.keys())
-        dict_keys(['camera_ids', 'gaussian_ids', 'radii', 'means2d', 'depths', 'conics',
+        dict_keys(['camera_ids', 'gaussian_ids', 'radii', 'means2d', 'means_c', 'conics',
         'opacities', 'tile_width', 'tile_height', 'tiles_per_gauss', 'isect_ids',
         'flatten_ids', 'isect_offsets', 'width', 'height', 'tile_size'])
 
@@ -375,7 +399,9 @@ def rasterization(
     assert opacities.shape == batch_dims + (N,), opacities.shape
     assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
     assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
-    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
+    assert render_mode in ["RGB", "D", "ED", "PD", "RGB+D", "RGB+ED", "RGB+PD"], render_mode
+    if render_mode in ["PD", "RGB+PD"]:
+        assert (quats is not None) and (scales is not None), "Computing plane depths requires quats and scales"
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -525,7 +551,7 @@ def rasterization(
             indptr,
             radii,
             means2d,
-            depths,
+            means_c,
             conics,
             compensations,
         ) = proj_results
@@ -533,7 +559,7 @@ def rasterization(
         image_ids = batch_ids * C + camera_ids
     else:
         # The results are with shape [..., C, N, ...]. Only the elements with radii > 0 are valid.
-        radii, means2d, depths, conics, compensations = proj_results
+        radii, means2d, means_c, conics, compensations = proj_results
         opacities = torch.broadcast_to(
             opacities[..., None, :], batch_dims + (C, N)
         )  # [..., C, N]
@@ -552,13 +578,13 @@ def rasterization(
             "gaussian_ids": gaussian_ids,
             "radii": radii,
             "means2d": means2d,
-            "depths": depths,
+            "means_c": means_c,
             "conics": conics,
             "opacities": opacities,
         }
     )
 
-    # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
+    # Turn colors into [..., C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
         # Colors are post-activation values, with shape [..., N, D] or [..., C, N, D]
         if packed:
@@ -638,9 +664,9 @@ def rasterization(
             (radii,) = all_to_all_tensor_list(
                 world_size, [radii], cnts, output_splits=collected_splits
             )
-            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+            (means2d, means_c, conics, opacities, colors) = all_to_all_tensor_list(
                 world_size,
-                [means2d, depths, conics, opacities, colors],
+                [means2d, means_c, conics, opacities, colors],
                 cnts,
                 output_splits=collected_splits,
             )
@@ -690,11 +716,11 @@ def rasterization(
             )
             radii = reshape_view(C, radii, N_world)
 
-            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+            (means2d, means_c, conics, opacities, colors) = all_to_all_tensor_list(
                 world_size,
                 [
                     means2d.flatten(0, 1),
-                    depths.flatten(0, 1),
+                    means_c.flatten(0, 1),
                     conics.flatten(0, 1),
                     opacities.flatten(0, 1),
                     colors.flatten(0, 1),
@@ -703,14 +729,16 @@ def rasterization(
                 output_splits=[C * N_i for N_i in N_world],
             )
             means2d = reshape_view(C, means2d, N_world)
-            depths = reshape_view(C, depths, N_world)
+            means_c = reshape_view(C, means_c, N_world)
             conics = reshape_view(C, conics, N_world)
             opacities = reshape_view(C, opacities, N_world)
             colors = reshape_view(C, colors, N_world)
 
-    # Rasterize to pixels
+    # Append per-Gaussian depth/distance to colors, which already in [..., C, N, D] or [nnz, D]
+    # The projected Gaussian centers (means_c) already in [..., C, N, 3] or [nnz, 3]
     if render_mode in ["RGB+D", "RGB+ED"]:
-        colors = torch.cat((colors, depths[..., None]), dim=-1)
+        # Append projected z-depth to blend with other features
+        colors = torch.cat((colors, means_c[..., 2:3]), dim=-1)
         if backgrounds is not None:
             backgrounds = torch.cat(
                 [
@@ -720,9 +748,108 @@ def rasterization(
                 dim=-1,
             )
     elif render_mode in ["D", "ED"]:
-        colors = depths[..., None]
+        # Only blend projected z-depth
+        colors = means_c[..., 2:3]
         if backgrounds is not None:
             backgrounds = torch.zeros(batch_dims + (C, 1), device=backgrounds.device)
+    elif render_mode in ["PD", "RGB+PD"]:
+        # Blend per-Gaussian distance and normals in camera space for plane depth
+        R = viewmats[..., :3, :3]  # [..., C, 3, 3]
+
+        if packed:
+            # Index quats/scales to visible Gaussians BEFORE any math
+            quats_flat   = quats.view(B, N, 4)[batch_ids, gaussian_ids]       # [nnz, 4]
+            scales_flat  = scales.view(B, N, 3)[batch_ids, gaussian_ids]      # [nnz, 3]
+            normals_flat = _quats_scales_to_normals(quats_flat, scales_flat)  # [nnz, 3]
+
+            # Rotate into camera space — apply split heuristic for pose optimization
+            R_flat_all = R.view(B, C, 3, 3)
+            avg_means_per_camera = batch_ids.shape[0] / (B * C)
+            split_batch_camera_ops = (
+                avg_means_per_camera > 10000
+                and R_flat_all.is_cuda
+                and viewmats.requires_grad
+            )
+            if not split_batch_camera_ops:
+                R_flat = R_flat_all[batch_ids, camera_ids]                       # [nnz, 3, 3]
+                normals_c = (R_flat @ normals_flat.unsqueeze(-1)).squeeze(-1)    # [nnz, 3]
+            else:
+                normals_c = torch.empty_like(normals_flat)
+                indptr_cpu = indptr.cpu()
+                for b_idx in range(B):
+                    for c_idx in range(C):
+                        bc_idx    = b_idx * C + c_idx
+                        start_idx = indptr_cpu[bc_idx].item()
+                        end_idx   = indptr_cpu[bc_idx + 1].item()
+                        if start_idx == end_idx:
+                            continue
+                        n_chunk = normals_flat[start_idx:end_idx]                # [chunk, 3]
+                        R_bc    = R_flat_all[b_idx, c_idx]                       # [3, 3]
+                        normals_c[start_idx:end_idx] = (
+                            R_bc @ n_chunk.unsqueeze(-1)
+                        ).squeeze(-1)
+
+            # Flip to face camera + distance
+            dot       = (normals_c * means_c).sum(dim=-1, keepdim=True)  # [nnz, 1]
+            flip_sign = torch.where(dot > 0, -torch.ones_like(dot), torch.ones_like(dot))
+            normals_c = normals_c * flip_sign                                  # [nnz, 3]
+            distances = (normals_c * means_c).sum(dim=-1, keepdim=True).abs()  # [nnz, 1]
+
+        else:
+            # Decide whether filtering is worth it
+            valid = (radii > 0).all(dim=-1)  # [..., C, N]
+            valid_any_camera = valid.any(dim=-2)                       # [..., N] visible in any camera
+            valid_any_global = valid_any_camera.view(B, N).any(dim=0)  # [N] visible in any batch
+            # Count unique visible Gaussians across all batches
+            n_valid = valid_any_global.sum().item()
+            use_filter = (n_valid / N) < 0.5  # only filter if <50% Gaussians visible
+
+            if use_filter:
+                # Compute only for visible Gaussians
+                valid_idx = valid_any_global.nonzero(as_tuple=True)[0]  # [n_valid]
+                normals_valid = _quats_scales_to_normals(
+                    quats.view(B, N, 4)[:, valid_idx],
+                    scales.view(B, N, 3)[:, valid_idx],
+                ) # [B, n_valid, 3]
+
+                # Scatter back to full [..., N, 3]
+                normals = torch.zeros(*batch_dims, N, 3, device=quats.device, dtype=quats.dtype)
+                normals.view(B, N, 3)[:, valid_idx] = normals_valid  # [..., N, 3]
+            else:
+                normals = _quats_scales_to_normals(quats, scales)    # [..., N, 3]
+
+            # Rotate all N normals into camera space
+            normals_exp = normals[..., None, :, :].expand(*batch_dims, C, N, 3) # [..., C, N, 3]
+            normals_c   = torch.einsum("...cij,...cnj->...cni", R, normals_exp) # [..., C, N, 3]
+
+            # Flip to face camera
+            dot       = (normals_c * means_c).sum(dim=-1, keepdim=True)         # [..., C, N, 1]
+            flip_sign = torch.where(dot > 0, -torch.ones_like(dot), torch.ones_like(dot))
+            normals_c = normals_c * flip_sign                                   # [..., C, N, 3]
+
+            # Distance — zero out invalid Gaussians
+            distances = (normals_c * means_c).sum(dim=-1, keepdim=True).abs()  # [..., C, N, 1]
+            valid_mask = valid.unsqueeze(-1)                                   # [..., C, N, 1]
+            normals_c  = normals_c  * valid_mask                               # [..., C, N, 3]
+            distances  = distances  * valid_mask                               # [..., C, N, 1]
+
+        # Append to colors
+        meta.update({"distances": distances, "normals_c": normals_c})
+
+        if render_mode == "RGB+PD":
+            colors = torch.cat([colors, distances, normals_c], dim=-1)
+            if backgrounds is not None:
+                backgrounds = torch.cat(
+                    [
+                        backgrounds,
+                        torch.zeros(batch_dims + (C, 4), device=backgrounds.device)
+                    ],
+                    dim=-1,
+                )
+        else:  # "PD" only
+            colors = torch.cat([distances, normals_c], dim=-1)
+            if backgrounds is not None:
+                backgrounds = torch.zeros(batch_dims + (C, 4), device=backgrounds.device)
     else:  # RGB
         pass
 
@@ -732,7 +859,7 @@ def rasterization(
     tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
         means2d,
         radii,
-        depths,
+        means_c[..., 2],
         tile_size,
         tile_width,
         tile_height,
@@ -762,6 +889,7 @@ def rasterization(
         }
     )
 
+    # Rasterize to pixels
     # print("rank", world_rank, "Before rasterize_to_pixels")
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
@@ -864,6 +992,38 @@ def rasterization(
             ],
             dim=-1,
         )
+    elif render_mode in ["PD", "RGB+PD"]:
+        # Split blended outputs — last 4 channels are [distance, nx, ny, nz]
+        render_distances = render_colors[..., -4:-3] # [..., C, H, W, 1]
+        render_normals_c = render_colors[..., -3:]   # [..., C, H, W, 3]
+        render_normals_c = render_normals_c / render_normals_c.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Build ray directions in camera space from intrinsics
+        # For pinhole: ray(u,v) = [(u-cx)/fx, (v-cy)/fy, 1]  (unnormalized)
+        u = torch.arange(width,  device=means.device, dtype=means.dtype)  # (W,)
+        v = torch.arange(height, device=means.device, dtype=means.dtype)  # (H,)
+        v_grid, u_grid = torch.meshgrid(v, u, indexing="ij")  # (H, W)
+
+        # Ks: [..., C, 3, 3]
+        fx = Ks[..., 0, 0][..., None, None]  # [..., C, 1, 1]
+        fy = Ks[..., 1, 1][..., None, None]
+        cx = Ks[..., 0, 2][..., None, None]
+        cy = Ks[..., 1, 2][..., None, None]
+
+        rx = (u_grid - cx) / fx  # [..., C, H, W]
+        ry = (v_grid - cy) / fy
+        rz = torch.ones_like(rx)
+        rays = torch.stack([rx, ry, rz], dim=-1)  # [..., C, H, W, 3]
+
+        denoms = (render_normals_c * rays).sum(dim=-1, keepdim=True)   # [..., C, H, W, 1]
+        plane_depths = render_distances / denoms.abs().clamp(min=1e-8) # [..., C, H, W, 1]
+
+        if render_mode == "RGB+PD":
+            # Replace the last 4 channels (normals+distance) with 1 channel (depth)
+            render_colors = torch.cat([render_colors[..., :-4], plane_depths], dim=-1)
+        else:  # "PD" only
+            render_colors = plane_depths
+
 
     return render_colors, render_alphas, meta
 

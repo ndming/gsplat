@@ -51,7 +51,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     // outputs
     int32_t *__restrict__ radii,         // [B, C, N, 2]
     scalar_t *__restrict__ means2d,      // [B, C, N, 2]
-    scalar_t *__restrict__ depths,       // [B, C, N]
+    scalar_t *__restrict__ means_c,      // [B, C, N, 3]
     scalar_t *__restrict__ conics,       // [B, C, N, 3]
     scalar_t *__restrict__ compensations // [B, C, N] optional
 ) {
@@ -219,7 +219,9 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     radii[idx * 2 + 1] = (int32_t)radius_y;
     means2d[idx * 2] = mean2d.x;
     means2d[idx * 2 + 1] = mean2d.y;
-    depths[idx] = mean_c.z;
+    means_c[idx * 3] = mean_c.x;
+    means_c[idx * 3 + 1] = mean_c.y;
+    means_c[idx * 3 + 2] = mean_c.z;
     conics[idx * 3] = covar2d_inv[0][0];
     conics[idx * 3 + 1] = covar2d_inv[0][1];
     conics[idx * 3 + 2] = covar2d_inv[1][1];
@@ -247,7 +249,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     // outputs
     at::Tensor radii,                      // [..., C, N, 2]
     at::Tensor means2d,                    // [..., C, N, 2]
-    at::Tensor depths,                     // [..., C, N]
+    at::Tensor means_c,                    // [..., C, N, 3]
     at::Tensor conics,                     // [..., C, N, 3]
     at::optional<at::Tensor> compensations // [..., C, N] optional
 ) {
@@ -297,7 +299,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
                     camera_model,
                     radii.data_ptr<int32_t>(),
                     means2d.data_ptr<scalar_t>(),
-                    depths.data_ptr<scalar_t>(),
+                    means_c.data_ptr<scalar_t>(),
                     conics.data_ptr<scalar_t>(),
                     compensations.has_value()
                         ? compensations.value().data_ptr<scalar_t>()
@@ -329,7 +331,7 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     const scalar_t *__restrict__ compensations, // [B, C, N] optional
     // grad outputs
     const scalar_t *__restrict__ v_means2d,       // [B, C, N, 2]
-    const scalar_t *__restrict__ v_depths,        // [B, C, N]
+    const scalar_t *__restrict__ v_means_c,       // [B, C, N, 3]
     const scalar_t *__restrict__ v_conics,        // [B, C, N, 3]
     const scalar_t *__restrict__ v_compensations, // [B, C, N] optional
     // grad inputs
@@ -356,7 +358,7 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     conics += idx * 3;
 
     v_means2d += idx * 2;
-    v_depths += idx;
+    v_means_c += idx * 3;
     v_conics += idx * 3;
 
     // vjp: compute the inverse of the 2d covariance
@@ -472,8 +474,10 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
         break;
     }
 
-    // add contribution from v_depths
-    v_mean_c.z += v_depths[0];
+    // add contribution from v_means_c
+    v_mean_c.x += v_means_c[0];
+    v_mean_c.y += v_means_c[1];
+    v_mean_c.z += v_means_c[2];
 
     // vjp: transform Gaussian covariance to camera space
     vec3 v_mean(0.f);
@@ -566,7 +570,7 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
     const at::optional<at::Tensor> compensations, // [..., C, N] optional
     // grad outputs
     const at::Tensor v_means2d,                     // [..., C, N, 2]
-    const at::Tensor v_depths,                      // [..., C, N]
+    const at::Tensor v_means_c,                     // [..., C, N, 3]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
     const bool viewmats_requires_grad,
@@ -622,7 +626,7 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
                         ? compensations.value().data_ptr<scalar_t>()
                         : nullptr,
                     v_means2d.data_ptr<scalar_t>(),
-                    v_depths.data_ptr<scalar_t>(),
+                    v_means_c.data_ptr<scalar_t>(),
                     v_conics.data_ptr<scalar_t>(),
                     v_compensations.has_value()
                         ? v_compensations.value().data_ptr<scalar_t>()
