@@ -757,7 +757,7 @@ def rasterization(
         R = viewmats[..., :3, :3]  # [..., C, 3, 3]
 
         if packed:
-            # Index quats/scales to visible Gaussians BEFORE any math
+            # Index quats/scales to visible Gaussians
             quats_flat   = quats.view(B, N, 4)[batch_ids, gaussian_ids]       # [nnz, 4]
             scales_flat  = scales.view(B, N, 3)[batch_ids, gaussian_ids]      # [nnz, 3]
             normals_flat = _quats_scales_to_normals(quats_flat, scales_flat)  # [nnz, 3]
@@ -805,7 +805,7 @@ def rasterization(
             use_filter = (n_valid / N) < 0.5  # only filter if <50% Gaussians visible
 
             if use_filter:
-                # Compute only for visible Gaussians
+                # Compute normals only for visible Gaussians
                 valid_idx = valid_any_global.nonzero(as_tuple=True)[0]  # [n_valid]
                 normals_valid = _quats_scales_to_normals(
                     quats.view(B, N, 4)[:, valid_idx],
@@ -816,6 +816,7 @@ def rasterization(
                 normals = torch.zeros(*batch_dims, N, 3, device=quats.device, dtype=quats.dtype)
                 normals.view(B, N, 3)[:, valid_idx] = normals_valid  # [..., N, 3]
             else:
+                # Compute normals for all Gaussians
                 normals = _quats_scales_to_normals(quats, scales)    # [..., N, 3]
 
             # Rotate all N normals into camera space
@@ -834,7 +835,10 @@ def rasterization(
             distances  = distances  * valid_mask                               # [..., C, N, 1]
 
         # Append to colors
-        meta.update({"distances": distances, "normals_c": normals_c})
+        meta.update({
+            "distances": distances,
+            "normals_c": normals_c,
+        })
 
         if render_mode == "RGB+PD":
             colors = torch.cat([colors, distances, normals_c], dim=-1)
@@ -996,7 +1000,6 @@ def rasterization(
         # Split blended outputs — last 4 channels are [distance, nx, ny, nz]
         render_distances = render_colors[..., -4:-3] # [..., C, H, W, 1]
         render_normals_c = render_colors[..., -3:]   # [..., C, H, W, 3]
-        render_normals_c = render_normals_c / render_normals_c.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
         # Build ray directions in camera space from intrinsics
         # For pinhole: ray(u,v) = [(u-cx)/fx, (v-cy)/fy, 1]  (unnormalized)
@@ -1016,13 +1019,30 @@ def rasterization(
         rays = torch.stack([rx, ry, rz], dim=-1)  # [..., C, H, W, 3]
 
         denoms = (render_normals_c * rays).sum(dim=-1, keepdim=True)   # [..., C, H, W, 1]
-        plane_depths = render_distances / denoms.abs().clamp(min=1e-8) # [..., C, H, W, 1]
+        plane_depths = render_distances / -(denoms + 1e-8)             # [..., C, H, W, 1]
+
+        # Finite differences in camera space — equivalent to depth_to_normal
+        # but skipping the camtoworlds rotation since we stay in camera space
+        points_c = plane_depths * rays  # [..., C, H, W, 3]
+        dx = points_c[..., 2:, 1:-1, :] - points_c[..., :-2, 1:-1, :]  # [..., C, H-2, W-2, 3]
+        dy = points_c[..., 1:-1, 2:, :] - points_c[..., 1:-1, :-2, :]  # [..., C, H-2, W-2, 3]
+
+        # Cross product -> normals pointing toward camera (-z in cam space)
+        # dx is vertical (+y), dy is horizontal (+x)
+        depth_normals = F.normalize(torch.cross(dx, dy, dim=-1), dim=-1)     # [..., C, H-2, W-2, 3]
+        depth_normals = F.pad(depth_normals, (0, 0, 1, 1, 1, 1), value=0.0)  # [..., C, H, W, 3]
 
         if render_mode == "RGB+PD":
             # Replace the last 4 channels (normals+distance) with 1 channel (depth)
             render_colors = torch.cat([render_colors[..., :-4], plane_depths], dim=-1)
         else:  # "PD" only
             render_colors = plane_depths
+
+        meta.update({
+            "render_distances": render_distances,  # blended distances
+            "render_normals_c": render_normals_c,  # blended Gaussian normals
+            "depth_normals":    depth_normals,     # depth-derived normals
+        })
 
 
     return render_colors, render_alphas, meta
