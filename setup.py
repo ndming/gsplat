@@ -58,9 +58,7 @@ def get_extensions():
     undef_macros = []
     define_macros = []
 
-    extra_compile_args = {"cxx": ["-O3"]}
-    if not os.name == "nt":  # Not on Windows:
-        extra_compile_args["cxx"] += ["-Wno-sign-compare"]
+    extra_compile_args = {"cxx": ["-O3"]} if not os.name == "nt" else {"cxx": ["/O2", "-Wno-sign-compare"]}
     extra_link_args = [] if WITH_SYMBOLS else ["-s"]
 
     info = parallel_info()
