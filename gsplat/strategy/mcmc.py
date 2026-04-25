@@ -44,6 +44,7 @@ class MCMCStrategy(Strategy):
         teleport_stop_iter (int): Stop teleporting GSs in the refinement window after this iteration. Default to 25_000.
         noise_injection_stop_iter (int): Stop injecting noise after this iteration. Default to -1 (never stop).
             Use this to stop noise injection during controller distillation while keeping refine_stop_iter separate.
+        spawn_factor (float): GSs are spawned so that the new total number of GSs = current * spawn_factor. Default to 1.05.
         refine_every (int): Refine GSs every this steps. Default to 100.
         min_opacity (float): GSs with opacity below this value will be pruned. Default to 0.005.
         verbose (bool): Whether to print verbose information. Default to False.
@@ -71,6 +72,7 @@ class MCMCStrategy(Strategy):
     teleport_stop_iter: int = 25_000
     noise_injection_stop_iter: int = -1
     refine_every: int = 100
+    spawn_factor: float = 1.05
     min_opacity: float = 0.005
     verbose: bool = False
 
@@ -203,7 +205,7 @@ class MCMCStrategy(Strategy):
         binoms: Tensor,
     ) -> int:
         current_n_points = len(params["means"])
-        n_target = min(self.cap_max, int(1.05 * current_n_points))
+        n_target = min(self.cap_max, int(self.spawn_factor * current_n_points))
         n_gs = max(0, n_target - current_n_points)
         if n_gs > 0:
             sample_add(
