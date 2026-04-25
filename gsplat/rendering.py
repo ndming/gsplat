@@ -823,16 +823,15 @@ def rasterization(
             normals_exp = normals[..., None, :, :].expand(*batch_dims, C, N, 3) # [..., C, N, 3]
             normals_c   = torch.einsum("...cij,...cnj->...cni", R, normals_exp) # [..., C, N, 3]
 
-            # Flip to face camera
-            dot       = (normals_c * means_c).sum(dim=-1, keepdim=True)         # [..., C, N, 1]
-            flip_sign = torch.where(dot > 0, -torch.ones_like(dot), torch.ones_like(dot))
-            normals_c = normals_c * flip_sign                                   # [..., C, N, 3]
+            # Zero out invalid entries of means_c tensor
+            valid_mask   = valid.unsqueeze(-1)  # [..., C, N, 1]
+            means_c_safe = torch.where(valid_mask, means_c, torch.zeros_like(means_c))
 
-            # Distance — zero out invalid Gaussians
-            distances = (normals_c * means_c).sum(dim=-1, keepdim=True).abs()  # [..., C, N, 1]
-            valid_mask = valid.unsqueeze(-1)                                   # [..., C, N, 1]
-            normals_c  = normals_c  * valid_mask                               # [..., C, N, 3]
-            distances  = distances  * valid_mask                               # [..., C, N, 1]
+            # Flip normals to face camera and compute distances
+            dot       = (normals_c * means_c_safe).sum(dim=-1, keepdim=True)  # [..., C, N, 1]
+            flip_sign = torch.where(dot > 0, -torch.ones_like(dot), torch.ones_like(dot))
+            normals_c = normals_c * flip_sign                                       # [..., C, N, 3]
+            distances = (normals_c * means_c_safe).sum(dim=-1, keepdim=True).abs()  # [..., C, N, 1]
 
         # Append to colors
         meta.update({
