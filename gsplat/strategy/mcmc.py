@@ -41,6 +41,7 @@ class MCMCStrategy(Strategy):
         noise_lr (float): MCMC samping noise learning rate. Default to 5e5.
         refine_start_iter (int): Start refining GSs after this iteration. Default to 500.
         refine_stop_iter (int): Stop refining GSs after this iteration. Default to 25_000.
+        teleport_stop_iter (int): Stop teleporting GSs in the refinement window after this iteration. Default to 25_000.
         noise_injection_stop_iter (int): Stop injecting noise after this iteration. Default to -1 (never stop).
             Use this to stop noise injection during controller distillation while keeping refine_stop_iter separate.
         refine_every (int): Refine GSs every this steps. Default to 100.
@@ -67,6 +68,7 @@ class MCMCStrategy(Strategy):
     noise_lr: float = 5e5
     refine_start_iter: int = 500
     refine_stop_iter: int = 25_000
+    teleport_stop_iter: int = 25_000
     noise_injection_stop_iter: int = -1
     refine_every: int = 100
     min_opacity: float = 0.005
@@ -107,17 +109,6 @@ class MCMCStrategy(Strategy):
         for key in ["means", "scales", "quats", "opacities"]:
             assert key in params, f"{key} is required in params but missing."
 
-    # def step_pre_backward(
-    #     self,
-    #     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    #     optimizers: Dict[str, torch.optim.Optimizer],
-    #     # state: Dict[str, Any],
-    #     step: int,
-    #     info: Dict[str, Any],
-    # ):
-    #     """Callback function to be executed before the `loss.backward()` call."""
-    #     pass
-
     def step_post_backward(
         self,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -142,10 +133,11 @@ class MCMCStrategy(Strategy):
             and step > self.refine_start_iter
             and step % self.refine_every == 0
         ):
-            # teleport GSs
-            n_relocated_gs = self._relocate_gs(params, optimizers, binoms)
-            if self.verbose:
-                print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
+            if step < self.teleport_stop_iter:
+                # teleport GSs
+                n_relocated_gs = self._relocate_gs(params, optimizers, binoms)
+                if self.verbose:
+                    print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
 
             # add new GSs
             n_new_gs = self._add_new_gs(params, optimizers, binoms)
