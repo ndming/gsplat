@@ -29,6 +29,334 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
+// ---------------------------------------------------------------------------
+// RaDe-GS geometry: per-Gaussian depth-plane coefficients and camera-space
+// normal. Kept close to HKUST-SAIL/RaDe-GS `computeCov2D` so the math stays
+// cross-checkable. The depth of the Gaussian's tangent plane along the ray
+// through pixel offset d = (mean2d - pix) is  t = rp.x*d.x + rp.y*d.y + rp.z,
+// with rp.z = tc (ray distance to the center) and rp.w = rsigma (used only by
+// the GGGS median, not by RD). `W` is the world->camera rotation (gsplat's `R`).
+// ---------------------------------------------------------------------------
+inline __device__ void compute_ray_plane_normal(
+    const vec3 mean_c,
+    const mat3 W,     // TRANSPOSED world->camera rotation (RaDe glm convention;
+                      // = glm::transpose(gsplat W2C rotation)). See call sites.
+    const vec4 quat,  // [w, x, y, z], unnormalized
+    const vec3 scale, // per-axis scale (already activated)
+    const float fx,
+    const float fy,
+    vec4 &ray_plane,  // out: {gx, gy, tc, rsigma}
+    vec3 &normal_out  // out: camera-space unit normal
+) {
+    const vec3 t = mean_c;
+    const float tc = sqrtf(t.x * t.x + t.y * t.y + t.z * t.z);
+    const float u = t.x / t.z;
+    const float v = t.y / t.z;
+
+    // inverse scaling matrix
+    const float sx = scale[0], sy = scale[1], sz = scale[2];
+    mat3 S_inv = mat3(1.f / sx, 0.f, 0.f, 0.f, 1.f / sy, 0.f, 0.f, 0.f, 1.f / sz);
+
+    // rotation from the normalized quaternion (RaDe column-major convention;
+    // NOT gsplat's quat_to_rotmat, which is the transpose)
+    const float qn =
+        rsqrtf(quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2] + quat[3] * quat[3]);
+    const float r = quat[0] * qn, x = quat[1] * qn, y = quat[2] * qn, z = quat[3] * qn;
+    mat3 R = mat3(
+        1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+        2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+        2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+    );
+
+    // inverse camera-space covariance, with a rank-1 fallback for flat Gaussians
+    int min_id = (sy < sx) ? 1 : 0;
+    if (sz < scale[min_id]) {
+        min_id = 2;
+    }
+    const bool well_conditioned = scale[min_id] > 1e-7f;
+
+    mat3 cov_cam_inv;
+    if (well_conditioned) {
+        mat3 M_inv = S_inv * R * W;
+        cov_cam_inv = glm::transpose(M_inv) * M_inv;
+    } else {
+        vec3 rmin = {R[0][min_id], R[1][min_id], R[2][min_id]};
+        vec3 M_inv = rmin * W;
+        cov_cam_inv = glm::outerProduct(M_inv, M_inv);
+    }
+
+    const vec3 uvh = {u, v, 1.f};
+    const vec3 uvh_m = cov_cam_inv * uvh;
+    const vec3 uvh_mn = glm::normalize(uvh_m);
+
+    if (isnan(uvh_mn.x)) {
+        ray_plane = {0.f, 0.f, 0.f, 0.f};
+        normal_out = {0.f, 0.f, -1.f};
+        return;
+    }
+
+    const float u2 = u * u, v2 = v * v, uv = u * v;
+    const float l = tc;
+    mat3 nJ_inv = mat3(v2 + 1.f, -uv, 0.f, -uv, u2 + 1.f, 0.f, -u, -v, 0.f);
+
+    const float vbn = glm::dot(uvh_mn, uvh);
+    const float vb = glm::dot(uvh_m, uvh);
+    const float ray_len2 = u2 + v2 + 1.f;
+    const float factor_normal = l / ray_len2;
+    vec3 plane = nJ_inv * (uvh_mn / fmaxf(vbn, 1e-7f));
+    const float rsigma = well_conditioned ? sqrtf(fmaxf(vb / ray_len2, 0.f)) : 0.f;
+
+    ray_plane = {plane[0] * factor_normal / fx, plane[1] * factor_normal / fy, tc, rsigma};
+
+    vec3 ray_normal_vector = {-plane[0] * factor_normal, -plane[1] * factor_normal, -1.f};
+    mat3 nJ = mat3(
+        1.f / t.z, 0.f, -t.x / (t.z * t.z),
+        0.f, 1.f / t.z, -t.y / (t.z * t.z),
+        t.x / l, t.y / l, t.z / l
+    );
+    normal_out = glm::normalize(nJ * ray_normal_vector);
+}
+
+// ---------------------------------------------------------------------------
+// VJP of compute_ray_plane_normal. Ported from HKUST-SAIL/RaDe-GS
+// computeCov2DCUDA (scales branch, geometry-only parts: no conic/coef path,
+// no frustum clamp to match the forward here). Produces the geometry
+// contributions to {mean_c, scale, quat_raw}. `W` is world->camera rotation.
+// ---------------------------------------------------------------------------
+inline __device__ void compute_ray_plane_normal_vjp(
+    const vec3 mean_c,
+    const mat3 W,
+    const vec4 quat_raw,
+    const vec3 scale,
+    const float fx,
+    const float fy,
+    const vec4 v_ray_plane, // {dL/dgx, dL/dgy, dL/dtc, -}
+    const vec3 v_normal,    // dL/dnormal (camera space, unnormalized grad)
+    vec3 &v_mean_c,         // out (added to)
+    vec3 &v_scale_out,      // out
+    vec4 &v_quat_out        // out (w.r.t. raw quaternion)
+) {
+    vec3 t = mean_c;
+
+    // gradient of tc = |mean_c| (ray_plane.z)
+    const float rtc = rsqrtf(t.x * t.x + t.y * t.y + t.z * t.z);
+    const float dL_dtc = v_ray_plane[2];
+    const vec3 dL_dt_tc = {t.x * rtc * dL_dtc, t.y * rtc * dL_dtc, t.z * rtc * dL_dtc};
+
+    // undo the /focal baked into ray_plane.xy in the forward
+    const float dL_drp_x = v_ray_plane[0] / fx;
+    const float dL_drp_y = v_ray_plane[1] / fy;
+
+    const float u = t.x / t.z;
+    const float v = t.y / t.z;
+
+    // scaling and rotation (RaDe convention, normalized quaternion)
+    const float sx = scale[0], sy = scale[1], sz = scale[2];
+    mat3 S_inv = mat3(1.f / sx, 0.f, 0.f, 0.f, 1.f / sy, 0.f, 0.f, 0.f, 1.f / sz);
+    const float qn = rsqrtf(
+        quat_raw[0] * quat_raw[0] + quat_raw[1] * quat_raw[1] +
+        quat_raw[2] * quat_raw[2] + quat_raw[3] * quat_raw[3]
+    );
+    const float qr = quat_raw[0] * qn, qx = quat_raw[1] * qn, qy = quat_raw[2] * qn,
+                qz = quat_raw[3] * qn;
+    mat3 R = mat3(
+        1.f - 2.f * (qy * qy + qz * qz), 2.f * (qx * qy - qr * qz), 2.f * (qx * qz + qr * qy),
+        2.f * (qx * qy + qr * qz), 1.f - 2.f * (qx * qx + qz * qz), 2.f * (qy * qz - qr * qx),
+        2.f * (qx * qz - qr * qy), 2.f * (qy * qz + qr * qx), 1.f - 2.f * (qx * qx + qy * qy)
+    );
+
+    int min_id = (sy < sx) ? 1 : 0;
+    if (sz < scale[min_id]) {
+        min_id = 2;
+    }
+    const bool well_conditioned = scale[min_id] > 1e-7f;
+
+    mat3 cov_cam_inv;
+    mat3 Vrk_inv;
+    if (well_conditioned) {
+        mat3 M_inv = S_inv * R * W;
+        cov_cam_inv = glm::transpose(M_inv) * M_inv;
+        mat3 M_inv2 = S_inv * R;
+        Vrk_inv = glm::transpose(M_inv2) * M_inv2;
+    } else {
+        vec3 rmin = {R[0][min_id], R[1][min_id], R[2][min_id]};
+        vec3 M_inv = rmin * W;
+        cov_cam_inv = glm::outerProduct(M_inv, M_inv);
+        Vrk_inv = glm::outerProduct(rmin, rmin);
+    }
+
+    const vec3 uvh = {u, v, 1.f};
+    const vec3 uvh_m = cov_cam_inv * uvh;
+    const vec3 uvh_mn = glm::normalize(uvh_m);
+
+    const float u2 = u * u, v2 = v * v, uv = u * v;
+
+    mat3 dL_dVrk;
+    vec3 dL_dr;
+    float dL_du, dL_dv, dL_dz;
+    {
+        const float vb = glm::dot(uvh_m, uvh);
+        const float l = 1.f / rtc; // |t|
+        mat3 nJ = mat3(
+            1.f / t.z, 0.f, -(t.x) / (t.z * t.z),
+            0.f, 1.f / t.z, -(t.y) / (t.z * t.z),
+            t.x / l, t.y / l, t.z / l
+        );
+        mat3 nJ_inv = mat3(v2 + 1.f, -uv, 0.f, -uv, u2 + 1.f, 0.f, -u, -v, 0.f);
+
+        const float clamp_vb = fmaxf(vb, 1e-7f);
+        const float vbn = glm::dot(uvh_mn, uvh);
+        const float clamp_vbn = fmaxf(vbn, 1e-7f);
+        const float ray_len2 = u2 + v2 + 1.f;
+        const float ray_len_inv = rsqrtf(ray_len2);
+        const float factor_normal = l / ray_len2;
+        const vec3 uvh_m_vb = uvh_mn / clamp_vbn;
+        vec3 plane = nJ_inv * uvh_m_vb;
+        vec3 ray_normal_vector = {-plane.x * factor_normal, -plane.y * factor_normal, -1.f};
+
+        vec3 cam_normal_vector = nJ * ray_normal_vector;
+        vec3 normal_vector = glm::normalize(cam_normal_vector);
+        // NOTE: This deliberately mirrors RaDe-GS render_backward.cu:445, which computes
+        // rlv from the ALREADY-normalized normal_vector (so rlv ~= 1), NOT from the raw
+        // cam_normal_vector. The mathematically correct normalize-VJP factor is
+        // 1/|cam_normal_vector| (rsqrtf of the un-normalized vector); RaDe's rlv~=1 drops
+        // that 1/|x|, over-weighting the normal gradient for tilted disks and flattening
+        // them harder. We match RaDe on purpose to reproduce its training dynamics for
+        // surface reconstruction. Re-verify against GGGS source when cloned. See memory
+        // "depth-render-modes-task" (rlv normalize-VJP).
+        const float rlv = rsqrtf(
+            normal_vector.x * normal_vector.x +
+            normal_vector.y * normal_vector.y +
+            normal_vector.z * normal_vector.z
+        );
+        vec3 dL_dcam_normal_vector =
+            (v_normal - normal_vector * glm::dot(normal_vector, v_normal)) * rlv;
+        vec3 dL_dray_normal_vector = glm::transpose(nJ) * dL_dcam_normal_vector;
+        mat3 dL_dnJ = glm::outerProduct(dL_dcam_normal_vector, ray_normal_vector);
+        const float dL_dfactor_normal =
+            plane.x * (-dL_dray_normal_vector.x + dL_drp_x) +
+            plane.y * (-dL_dray_normal_vector.y + dL_drp_y);
+
+        vec2 dL_dplane = {
+            (-dL_dray_normal_vector.x + dL_drp_x) * factor_normal,
+            (-dL_dray_normal_vector.y + dL_drp_y) * factor_normal
+        };
+        vec3 dL_dplane_append = {dL_dplane.x, dL_dplane.y, 0.f};
+
+        const float aux = dL_dplane.x * plane.x + dL_dplane.y * plane.y;
+        vec3 W_uvh = W * uvh;
+        vec3 dL_duvh_plane =
+            2.f * (-aux) * uvh_m_vb +
+            (cov_cam_inv / clamp_vb) * glm::transpose(nJ_inv) * dL_dplane_append;
+
+        const float aux_nJ =
+            (-dL_dnJ[2][0] * u - dL_dnJ[2][1] * v - dL_dnJ[2][2]) / ray_len2 * ray_len_inv;
+        const float dL_du_nJ = -dL_dnJ[0][2] / t.z + dL_dnJ[2][0] * ray_len_inv + aux_nJ * u;
+        const float dL_dv_nJ = -dL_dnJ[1][2] / t.z + dL_dnJ[2][1] * ray_len_inv + aux_nJ * v;
+        const float dL_dz_nJ =
+            (dL_dnJ[0][0] + dL_dnJ[1][1] - dL_dnJ[0][2] * u - dL_dnJ[1][2] * v) /
+            (-t.z * t.z);
+
+        mat3 dL_dnJ_inv = glm::outerProduct(dL_dplane_append, uvh_m_vb);
+        const float dL_du_plane = dL_duvh_plane.x +
+                                  (dL_dnJ_inv[0][1] + dL_dnJ_inv[1][0]) * (-v) +
+                                  2.f * dL_dnJ_inv[1][1] * u - dL_dnJ_inv[2][0];
+        const float dL_dv_plane = dL_duvh_plane.y +
+                                  (dL_dnJ_inv[0][1] + dL_dnJ_inv[1][0]) * (-u) +
+                                  2.f * dL_dnJ_inv[0][0] * v - dL_dnJ_inv[2][1];
+
+        const float aux_factor = dL_dfactor_normal * (-t.z / ray_len2 * ray_len_inv);
+        const float dL_du_factor = aux_factor * u;
+        const float dL_dv_factor = aux_factor * v;
+        const float dL_dz_factor = dL_dfactor_normal * ray_len_inv;
+
+        dL_du = dL_du_nJ + dL_du_plane + dL_du_factor;
+        dL_dv = dL_dv_nJ + dL_dv_plane + dL_dv_factor;
+        dL_dz = dL_dz_nJ + dL_dz_factor;
+
+        const float dL_dvb_xvb = -aux;
+        if (well_conditioned) {
+            dL_dVrk = -glm::outerProduct(
+                Vrk_inv * W_uvh,
+                Vrk_inv *
+                    (W * glm::transpose(nJ_inv) * dL_dplane_append + W_uvh * dL_dvb_xvb)
+            );
+            dL_dVrk = dL_dVrk / vb;
+            dL_dr = {0.f, 0.f, 0.f};
+        } else {
+            dL_dVrk = mat3(0.f);
+            vec3 nJ_inv_dL_dplane_xvb =
+                glm::transpose(nJ_inv) * vec3(dL_dplane.x, dL_dplane.y, 0.f);
+            mat3 dL_dVrk_inv =
+                glm::outerProduct(W_uvh, W_uvh * dL_dvb_xvb + W * nJ_inv_dL_dplane_xvb) / vb;
+            vec3 eigenvector_min = {R[0][min_id], R[1][min_id], R[2][min_id]};
+            dL_dr = (dL_dVrk_inv + glm::transpose(dL_dVrk_inv)) * eigenvector_min;
+        }
+    }
+
+    // dL/d mean_c from the (u, v, z) chain plus the tc term
+    const float tz = 1.f / t.z;
+    const float tz2 = tz * tz;
+    v_mean_c.x += dL_du * tz + dL_dt_tc.x;
+    v_mean_c.y += dL_dv * tz + dL_dt_tc.y;
+    v_mean_c.z += -(dL_du * t.x + dL_dv * t.y) * tz2 + dL_dz + dL_dt_tc.z;
+
+    // dL/d cov3D (world), symmetric packing
+    float dL_dcov3D[6];
+    dL_dcov3D[0] = dL_dVrk[0][0];
+    dL_dcov3D[1] = dL_dVrk[0][1] + dL_dVrk[1][0];
+    dL_dcov3D[2] = dL_dVrk[0][2] + dL_dVrk[2][0];
+    dL_dcov3D[3] = dL_dVrk[1][1];
+    dL_dcov3D[4] = dL_dVrk[1][2] + dL_dVrk[2][1];
+    dL_dcov3D[5] = dL_dVrk[2][2];
+
+    // computeCov3D VJP (Vrk = M^T M with M = S*R), RaDe convention
+    mat3 S = mat3(sx, 0.f, 0.f, 0.f, sy, 0.f, 0.f, 0.f, sz);
+    mat3 M = S * R;
+    mat3 dL_dSigma = mat3(
+        dL_dcov3D[0], 0.5f * dL_dcov3D[1], 0.5f * dL_dcov3D[2],
+        0.5f * dL_dcov3D[1], dL_dcov3D[3], 0.5f * dL_dcov3D[4],
+        0.5f * dL_dcov3D[2], 0.5f * dL_dcov3D[4], dL_dcov3D[5]
+    );
+    mat3 dL_dM = 2.f * M * dL_dSigma;
+    mat3 Rt = glm::transpose(R);
+    mat3 dL_dMt = glm::transpose(dL_dM);
+    v_scale_out[0] = glm::dot(Rt[0], dL_dMt[0]);
+    v_scale_out[1] = glm::dot(Rt[1], dL_dMt[1]);
+    v_scale_out[2] = glm::dot(Rt[2], dL_dMt[2]);
+    dL_dMt[0] *= sx;
+    dL_dMt[1] *= sy;
+    dL_dMt[2] *= sz;
+    dL_dMt[min_id] += dL_dr;
+
+    // dL/d normalized quaternion (RaDe formula)
+    vec4 dL_dqn;
+    dL_dqn[0] = 2.f * qz * (dL_dMt[0][1] - dL_dMt[1][0]) +
+                2.f * qy * (dL_dMt[2][0] - dL_dMt[0][2]) +
+                2.f * qx * (dL_dMt[1][2] - dL_dMt[2][1]);
+    dL_dqn[1] = 2.f * qy * (dL_dMt[1][0] + dL_dMt[0][1]) +
+                2.f * qz * (dL_dMt[2][0] + dL_dMt[0][2]) +
+                2.f * qr * (dL_dMt[1][2] - dL_dMt[2][1]) -
+                4.f * qx * (dL_dMt[2][2] + dL_dMt[1][1]);
+    dL_dqn[2] = 2.f * qx * (dL_dMt[1][0] + dL_dMt[0][1]) +
+                2.f * qr * (dL_dMt[2][0] - dL_dMt[0][2]) +
+                2.f * qz * (dL_dMt[1][2] + dL_dMt[2][1]) -
+                4.f * qy * (dL_dMt[2][2] + dL_dMt[0][0]);
+    dL_dqn[3] = 2.f * qr * (dL_dMt[0][1] - dL_dMt[1][0]) +
+                2.f * qx * (dL_dMt[2][0] + dL_dMt[0][2]) +
+                2.f * qy * (dL_dMt[1][2] + dL_dMt[2][1]) -
+                4.f * qz * (dL_dMt[1][1] + dL_dMt[0][0]);
+
+    // backprop through quaternion normalization: dL/dq_raw
+    const vec4 q_n = {quat_raw[0] * qn, quat_raw[1] * qn, quat_raw[2] * qn, quat_raw[3] * qn};
+    const float qdot =
+        q_n[0] * dL_dqn[0] + q_n[1] * dL_dqn[1] + q_n[2] * dL_dqn[2] + q_n[3] * dL_dqn[3];
+    v_quat_out[0] = (dL_dqn[0] - q_n[0] * qdot) * qn;
+    v_quat_out[1] = (dL_dqn[1] - q_n[1] * qdot) * qn;
+    v_quat_out[2] = (dL_dqn[2] - q_n[2] * qdot) * qn;
+    v_quat_out[3] = (dL_dqn[3] - q_n[3] * qdot) * qn;
+}
+
 template <typename scalar_t>
 __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     const uint32_t B,
@@ -53,7 +381,11 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     scalar_t *__restrict__ means2d,      // [B, C, N, 2]
     scalar_t *__restrict__ depths,       // [B, C, N]
     scalar_t *__restrict__ conics,       // [B, C, N, 3]
-    scalar_t *__restrict__ compensations // [B, C, N] optional
+    scalar_t *__restrict__ compensations,// [B, C, N] optional
+    // geometry rendering (RD/PD/MD/WD), optional
+    const bool render_geometry,
+    scalar_t *__restrict__ ray_planes,   // [B, C, N, 4] optional {gx,gy,tc,rsigma}
+    scalar_t *__restrict__ normals       // [B, C, N, 3] optional (camera space)
 ) {
     // parallelize over B * C * N.
     uint32_t idx = cg::this_grid().thread_rank();
@@ -226,6 +558,36 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     if (compensations != nullptr) {
         compensations[idx] = compensation;
     }
+
+    // RaDe-GS depth-plane + normal. Only reached when render_geometry is set,
+    // which the caller only allows with {quats, scales} (not precomputed covars),
+    // so the advanced quats/scales pointers point to this Gaussian here.
+    if (render_geometry) {
+        vec4 ray_plane;
+        vec3 normal;
+        compute_ray_plane_normal(
+            mean_c,
+            // RaDe's M_inv = S_inv*R_gaussian*W expects W as the world->camera
+            // rotation in glm column-major form, which equals the TRANSPOSE of
+            // gsplat's R (=W2C rotation). Passing R untransposed leaves depth ~ok
+            // (tc-dominated) but rotates the per-Gaussian normal on general
+            // orientations. Verified: transpose(R) reproduces RaDe's normal exactly.
+            glm::transpose(R),
+            glm::make_vec4(quats),
+            glm::make_vec3(scales),
+            Ks[0],
+            Ks[4],
+            ray_plane,
+            normal
+        );
+        ray_planes[idx * 4] = ray_plane[0];
+        ray_planes[idx * 4 + 1] = ray_plane[1];
+        ray_planes[idx * 4 + 2] = ray_plane[2];
+        ray_planes[idx * 4 + 3] = ray_plane[3];
+        normals[idx * 3] = normal[0];
+        normals[idx * 3 + 1] = normal[1];
+        normals[idx * 3 + 2] = normal[2];
+    }
 }
 
 void launch_projection_ewa_3dgs_fused_fwd_kernel(
@@ -245,11 +607,14 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     const float radius_clip,
     const CameraModelType camera_model,
     // outputs
-    at::Tensor radii,                      // [..., C, N, 2]
-    at::Tensor means2d,                    // [..., C, N, 2]
-    at::Tensor depths,                     // [..., C, N]
-    at::Tensor conics,                     // [..., C, N, 3]
-    at::optional<at::Tensor> compensations // [..., C, N] optional
+    at::Tensor radii,                       // [..., C, N, 2]
+    at::Tensor means2d,                     // [..., C, N, 2]
+    at::Tensor depths,                      // [..., C, N]
+    at::Tensor conics,                      // [..., C, N, 3]
+    at::optional<at::Tensor> compensations, // [..., C, N] optional
+    const bool render_geometry,
+    at::optional<at::Tensor> ray_planes,    // [..., C, N, 4] optional
+    at::optional<at::Tensor> normals        // [..., C, N, 3] optional
 ) {
     uint32_t N = means.size(-2);    // number of gaussians
     uint32_t C = viewmats.size(-3); // number of cameras
@@ -301,7 +666,12 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
                     conics.data_ptr<scalar_t>(),
                     compensations.has_value()
                         ? compensations.value().data_ptr<scalar_t>()
-                        : nullptr
+                        : nullptr,
+                    render_geometry,
+                    render_geometry ? ray_planes.value().data_ptr<scalar_t>()
+                                    : nullptr,
+                    render_geometry ? normals.value().data_ptr<scalar_t>()
+                                    : nullptr
                 );
         }
     );
@@ -332,6 +702,9 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     const scalar_t *__restrict__ v_depths,        // [B, C, N]
     const scalar_t *__restrict__ v_conics,        // [B, C, N, 3]
     const scalar_t *__restrict__ v_compensations, // [B, C, N] optional
+    // RaDe-GS geometry grad outputs (read only when non-null)
+    const scalar_t *__restrict__ v_ray_planes, // [B, C, N, 4] optional
+    const scalar_t *__restrict__ v_normals,    // [B, C, N, 3] optional
     // grad inputs
     scalar_t *__restrict__ v_means,   // [B, N, 3]
     scalar_t *__restrict__ v_covars,  // [B, N, 6] optional
@@ -475,6 +848,29 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     // add contribution from v_depths
     v_mean_c.z += v_depths[0];
 
+    // RaDe-GS geometry VJP: fold depth-plane + normal gradients into the
+    // camera-space mean here (transformed to world by posW2C_VJP below) and
+    // into scale/quat in the {quats, scales} branch.
+    vec3 v_scale_geo(0.f);
+    vec4 v_quat_geo(0.f);
+    if (v_ray_planes != nullptr) {
+        const vec4 v_rp = {
+            v_ray_planes[idx * 4],
+            v_ray_planes[idx * 4 + 1],
+            v_ray_planes[idx * 4 + 2],
+            v_ray_planes[idx * 4 + 3]
+        };
+        const vec3 v_nrm = {
+            v_normals[idx * 3], v_normals[idx * 3 + 1], v_normals[idx * 3 + 2]
+        };
+        compute_ray_plane_normal_vjp(
+            // Must match the forward: pass the transposed W2C rotation (see the
+            // compute_ray_plane_normal call in the forward kernel).
+            mean_c, glm::transpose(R), quat, scale, Ks[0], Ks[4], v_rp, v_nrm, v_mean_c,
+            v_scale_geo, v_quat_geo
+        );
+    }
+
     // vjp: transform Gaussian covariance to camera space
     vec3 v_mean(0.f);
     mat3 v_covar(0.f);
@@ -515,6 +911,9 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
         vec4 v_quat(0.f);
         vec3 v_scale(0.f);
         quat_scale_to_covar_vjp(quat, scale, rotmat, v_covar, v_quat, v_scale);
+        // add RaDe-GS geometry (depth-plane + normal) contributions
+        v_quat += v_quat_geo;
+        v_scale += v_scale_geo;
         warpSum(v_quat, warp_group_g);
         warpSum(v_scale, warp_group_g);
         if (warp_group_g.thread_rank() == 0) {
@@ -569,6 +968,8 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
+    const at::optional<at::Tensor> v_ray_planes,    // [..., C, N, 4] optional
+    const at::optional<at::Tensor> v_normals,       // [..., C, N, 3] optional
     const bool viewmats_requires_grad,
     // outputs
     at::Tensor v_means,   // [..., N, 3]
@@ -626,6 +1027,12 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
                     v_conics.data_ptr<scalar_t>(),
                     v_compensations.has_value()
                         ? v_compensations.value().data_ptr<scalar_t>()
+                        : nullptr,
+                    v_ray_planes.has_value()
+                        ? v_ray_planes.value().data_ptr<scalar_t>()
+                        : nullptr,
+                    v_normals.has_value()
+                        ? v_normals.value().data_ptr<scalar_t>()
                         : nullptr,
                     v_means.data_ptr<scalar_t>(),
                     covars.has_value() ? v_covars.data_ptr<scalar_t>()

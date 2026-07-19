@@ -138,7 +138,7 @@ def rasterization(
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
+    render_mode: Literal["RGB", "ZD", "RGB+ZD", "RGB+RD"] = "RGB",
     sparse_grad: bool = False,
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
@@ -375,7 +375,21 @@ def rasterization(
     assert opacities.shape == batch_dims + (N,), opacities.shape
     assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
     assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
-    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
+    assert render_mode in [
+        "RGB",
+        "ZD",
+        "RGB+ZD",
+        "RGB+RD",
+    ], render_mode
+
+    # Rendering geometry (depths and normals) impose a few restrictions 
+    render_geometry = render_mode in ["RGB+RD", "RGB+PD", "RGB+MD", "RGB+WD"] 
+    if render_geometry:
+        assert camera_model == "pinhole", "Geometry rendering requires the pinhole camera model"
+        assert not packed, "Geometry rendering is not supported in packed mode"
+        assert not with_ut, "Geometry rendering is not supported with the unscented transform"
+        assert not with_eval3d, "Geometry rendering is not supported with eval3d"
+        assert distributed is False, "Geometry rendering is not supported in distributed mode"
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -514,6 +528,7 @@ def rasterization(
             calc_compensations=(rasterize_mode == "antialiased"),
             camera_model=camera_model,
             opacities=opacities,  # use opacities to compute a tigher bound for radii.
+            render_geometry=render_geometry,
         )
 
     if packed:
@@ -533,7 +548,19 @@ def rasterization(
         image_ids = batch_ids * C + camera_ids
     else:
         # The results are with shape [..., C, N, ...]. Only the elements with radii > 0 are valid.
-        radii, means2d, depths, conics, compensations = proj_results
+        if render_geometry:
+            (
+                radii,
+                means2d,
+                depths,
+                conics,
+                compensations,
+                ray_planes,
+                normals,
+            ) = proj_results
+        else:
+            radii, means2d, depths, conics, compensations = proj_results
+            ray_planes, normals = None, None
         opacities = torch.broadcast_to(
             opacities[..., None, :], batch_dims + (C, N)
         )  # [..., C, N]
@@ -708,8 +735,10 @@ def rasterization(
             opacities = reshape_view(C, opacities, N_world)
             colors = reshape_view(C, colors, N_world)
 
-    # Rasterize to pixels
-    if render_mode in ["RGB+D", "RGB+ED"]:
+    # Rasterize to pixels. ZD appends the per-Gaussian z-depth as one channel;
+    # the expected depth will be derived after rasterization.
+    # RD/PD/MD/WD compute depth/normal inside the geometry kernel.
+    if render_mode == "RGB+ZD":
         colors = torch.cat((colors, depths[..., None]), dim=-1)
         if backgrounds is not None:
             backgrounds = torch.cat(
@@ -719,11 +748,11 @@ def rasterization(
                 ],
                 dim=-1,
             )
-    elif render_mode in ["D", "ED"]:
+    elif render_mode == "ZD":
         colors = depths[..., None]
         if backgrounds is not None:
             backgrounds = torch.zeros(batch_dims + (C, 1), device=backgrounds.device)
-    else:  # RGB
+    else:  # RGB, RGB+RD/PD/MD/WD
         pass
 
     # Identify intersecting tiles
@@ -761,6 +790,37 @@ def rasterization(
             "n_cameras": C,
         }
     )
+
+    # Geometry path: rasterize RGB + expected depth + median + camera-space normal in one pass.
+    if render_geometry:
+        (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_depths,
+            render_medians,
+        ) = rasterize_to_pixels(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            backgrounds=backgrounds,
+            packed=packed,
+            absgrad=absgrad,
+            ray_planes=ray_planes,
+            normals=normals,
+            Ks=Ks,
+            render_geometry=True,
+        )
+        render_colors = torch.cat(
+            [render_colors, render_depths, render_medians, render_normals], dim=-1
+        )  # [..., C, H, W, 8]
+        return render_colors, render_alphas, meta
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
     if colors.shape[-1] > channel_chunk:
@@ -855,14 +915,13 @@ def rasterization(
                 packed=packed,
                 absgrad=absgrad,
             )
-    if render_mode in ["ED", "RGB+ED"]:
-        # normalize the accumulated depth to get the expected depth
+    if render_mode in ["ZD", "RGB+ZD"]:
+        # The last rasterized channel is the accumulated depth D, we
+        # expose both the expected depth and the accumulated depth D:
+        d_accum = render_colors[..., -1:]
+        ed = d_accum / render_alphas.clamp(min=1e-10)
         render_colors = torch.cat(
-            [
-                render_colors[..., :-1],
-                render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
-            ],
-            dim=-1,
+            [render_colors[..., :-1], ed, d_accum], dim=-1
         )
 
     return render_colors, render_alphas, meta

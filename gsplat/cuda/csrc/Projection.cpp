@@ -123,6 +123,8 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
+    at::Tensor,
+    at::Tensor,
     at::Tensor>
 projection_ewa_3dgs_fused_fwd(
     const at::Tensor means,                // [..., N, 3]
@@ -139,7 +141,8 @@ projection_ewa_3dgs_fused_fwd(
     const float far_plane,
     const float radius_clip,
     const bool calc_compensations,
-    const CameraModelType camera_model
+    const CameraModelType camera_model,
+    const bool render_geometry
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -177,6 +180,22 @@ projection_ewa_3dgs_fused_fwd(
         compensations_shape.append({C, N});
         compensations = at::zeros(compensations_shape, opt);
     }
+    // 0-size placeholders keep the returned tuple well-defined when geometry is off
+    at::Tensor ray_planes = at::empty({0}, opt);
+    at::Tensor normals = at::empty({0}, opt);
+    if (render_geometry) {
+        // Geometry (RD/PD/MD/WD) requires {quats, scales}, not precomputed covars.
+        TORCH_CHECK(
+            !covars.has_value(),
+            "render_geometry requires quats/scales, not precomputed covars"
+        );
+        at::DimVector ray_planes_shape(batch_dims);
+        ray_planes_shape.append({C, N, 4});
+        ray_planes = at::empty(ray_planes_shape, opt);
+        at::DimVector normals_shape(batch_dims);
+        normals_shape.append({C, N, 3});
+        normals = at::empty(normals_shape, opt);
+    }
 
     launch_projection_ewa_3dgs_fused_fwd_kernel(
         // inputs
@@ -200,9 +219,14 @@ projection_ewa_3dgs_fused_fwd(
         depths,
         conics,
         calc_compensations ? at::optional<at::Tensor>(compensations)
-                           : c10::nullopt
+                           : c10::nullopt,
+        render_geometry,
+        render_geometry ? at::optional<at::Tensor>(ray_planes) : c10::nullopt,
+        render_geometry ? at::optional<at::Tensor>(normals) : c10::nullopt
     );
-    return std::make_tuple(radii, means2d, depths, conics, compensations);
+    return std::make_tuple(
+        radii, means2d, depths, conics, compensations, ray_planes, normals
+    );
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -227,6 +251,8 @@ projection_ewa_3dgs_fused_bwd(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
+    const at::optional<at::Tensor> v_ray_planes,    // [..., C, N, 4] optional
+    const at::optional<at::Tensor> v_normals,       // [..., C, N, 3] optional
     const bool viewmats_requires_grad
 ) {
     DEVICE_GUARD(means);
@@ -285,6 +311,8 @@ projection_ewa_3dgs_fused_bwd(
         v_depths,
         v_conics,
         v_compensations,
+        v_ray_planes,
+        v_normals,
         viewmats_requires_grad,
         // outputs
         v_means,

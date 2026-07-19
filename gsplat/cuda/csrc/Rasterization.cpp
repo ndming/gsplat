@@ -34,7 +34,16 @@ namespace gsplat {
 // 3DGS
 ////////////////////////////////////////////////////
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
@@ -48,7 +57,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     const uint32_t tile_size,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // geometry rendering (RD/PD/MD/WD)
+    const bool render_geometry,
+    const at::optional<at::Tensor> ray_planes, // [..., N, 4]
+    const at::optional<at::Tensor> normals,    // [..., N, 3]
+    const at::optional<at::Tensor> Ks          // [..., 3, 3]
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -62,6 +76,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     }
     if (masks.has_value()) {
         CHECK_INPUT(masks.value());
+    }
+    if (render_geometry) {
+        TORCH_CHECK(
+            ray_planes.has_value() && normals.has_value() && Ks.has_value(),
+            "render_geometry requires ray_planes, normals and Ks"
+        );
+        CHECK_INPUT(ray_planes.value());
+        CHECK_INPUT(normals.value());
+        CHECK_INPUT(Ks.value());
+        TORCH_CHECK(
+            colors.size(-1) == 3,
+            "render_geometry (RD/PD/MD/WD) requires 3 color channels"
+        );
     }
 
     auto opt = means2d.options();
@@ -80,6 +107,26 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     last_ids_dims.append({image_height, image_width});
     at::Tensor last_ids = at::empty(last_ids_dims, opt.dtype(at::kInt));
 
+    // Geometry outputs (0-size placeholders when geometry is off)
+    at::Tensor render_normals = at::empty({0}, opt);
+    at::Tensor render_depths = at::empty({0}, opt);
+    at::Tensor render_medians = at::empty({0}, opt);
+    at::Tensor normal_length = at::empty({0}, opt);
+    at::Tensor median_ids = at::empty({0}, opt.dtype(at::kInt));
+    if (render_geometry) {
+        at::DimVector normals_dims(image_dims);
+        normals_dims.append({image_height, image_width, 3});
+        render_normals = at::empty(normals_dims, opt);
+        at::DimVector scalar_dims(image_dims);
+        scalar_dims.append({image_height, image_width, 1});
+        render_depths = at::empty(scalar_dims, opt);
+        render_medians = at::empty(scalar_dims, opt);
+        normal_length = at::empty(scalar_dims, opt);
+        at::DimVector ids_dims(image_dims);
+        ids_dims.append({image_height, image_width});
+        median_ids = at::empty(ids_dims, opt.dtype(at::kInt));
+    }
+
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
         launch_rasterize_to_pixels_3dgs_fwd_kernel<N>(                         \
@@ -96,118 +143,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
             flatten_ids,                                                       \
             renders,                                                           \
             alphas,                                                            \
-            last_ids                                                           \
-        );                                                                     \
-        break;
-
-    // TODO: an optimization can be done by passing the actual number of
-    // channels into the kernel functions and avoid necessary global memory
-    // writes. This requires moving the channel padding from python to C side.
-    switch (channels) {
-        __LAUNCH_KERNEL__(1)
-        __LAUNCH_KERNEL__(2)
-        __LAUNCH_KERNEL__(3)
-        __LAUNCH_KERNEL__(4)
-        __LAUNCH_KERNEL__(5)
-        __LAUNCH_KERNEL__(8)
-        __LAUNCH_KERNEL__(9)
-        __LAUNCH_KERNEL__(16)
-        __LAUNCH_KERNEL__(17)
-        __LAUNCH_KERNEL__(32)
-        __LAUNCH_KERNEL__(33)
-        __LAUNCH_KERNEL__(64)
-        __LAUNCH_KERNEL__(65)
-        __LAUNCH_KERNEL__(128)
-        __LAUNCH_KERNEL__(129)
-        __LAUNCH_KERNEL__(256)
-        __LAUNCH_KERNEL__(257)
-        __LAUNCH_KERNEL__(512)
-        __LAUNCH_KERNEL__(513)
-    default:
-        AT_ERROR("Unsupported number of channels: ", channels);
-    }
-#undef __LAUNCH_KERNEL__
-
-    return std::make_tuple(renders, alphas, last_ids);
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-rasterize_to_pixels_3dgs_bwd(
-    // Gaussian parameters
-    const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
-    const at::Tensor conics,                    // [..., N, 3] or [nnz, 3]
-    const at::Tensor colors,                    // [..., N, channels] or [nnz, channels]
-    const at::Tensor opacities,                 // [..., N] or [nnz]
-    const at::optional<at::Tensor> backgrounds, // [..., channels]
-    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
-    // image size
-    const uint32_t image_width,
-    const uint32_t image_height,
-    const uint32_t tile_size,
-    // intersections
-    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
-    const at::Tensor flatten_ids,  // [n_isects]
-    // forward outputs
-    const at::Tensor render_alphas, // [..., image_height, image_width, 1]
-    const at::Tensor last_ids,      // [..., image_height, image_width]
-    // gradients of outputs
-    const at::Tensor v_render_colors, // [..., image_height, image_width, channels]
-    const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
-    // options
-    bool absgrad
-) {
-    DEVICE_GUARD(means2d);
-    CHECK_INPUT(means2d);
-    CHECK_INPUT(conics);
-    CHECK_INPUT(colors);
-    CHECK_INPUT(opacities);
-    CHECK_INPUT(tile_offsets);
-    CHECK_INPUT(flatten_ids);
-    CHECK_INPUT(render_alphas);
-    CHECK_INPUT(last_ids);
-    CHECK_INPUT(v_render_colors);
-    CHECK_INPUT(v_render_alphas);
-    if (backgrounds.has_value()) {
-        CHECK_INPUT(backgrounds.value());
-    }
-    if (masks.has_value()) {
-        CHECK_INPUT(masks.value());
-    }
-
-    uint32_t channels = colors.size(-1);
-
-    at::Tensor v_means2d = at::zeros_like(means2d);
-    at::Tensor v_conics = at::zeros_like(conics);
-    at::Tensor v_colors = at::zeros_like(colors);
-    at::Tensor v_opacities = at::zeros_like(opacities);
-    at::Tensor v_means2d_abs;
-    if (absgrad) {
-        v_means2d_abs = at::zeros_like(means2d);
-    }
-
-#define __LAUNCH_KERNEL__(N)                                                   \
-    case N:                                                                    \
-        launch_rasterize_to_pixels_3dgs_bwd_kernel<N>(                         \
-            means2d,                                                           \
-            conics,                                                            \
-            colors,                                                            \
-            opacities,                                                         \
-            backgrounds,                                                       \
-            masks,                                                             \
-            image_width,                                                       \
-            image_height,                                                      \
-            tile_size,                                                         \
-            tile_offsets,                                                      \
-            flatten_ids,                                                       \
-            render_alphas,                                                     \
             last_ids,                                                          \
-            v_render_colors,                                                   \
-            v_render_alphas,                                                   \
-            absgrad ? c10::optional<at::Tensor>(v_means2d_abs) : c10::nullopt, \
-            v_means2d,                                                         \
-            v_conics,                                                          \
-            v_colors,                                                          \
-            v_opacities                                                        \
+            render_geometry,                                                   \
+            ray_planes,                                                        \
+            normals,                                                           \
+            Ks,                                                                \
+            render_geometry ? at::optional<at::Tensor>(render_normals)         \
+                            : c10::nullopt,                                    \
+            render_geometry ? at::optional<at::Tensor>(render_depths)          \
+                            : c10::nullopt,                                    \
+            render_geometry ? at::optional<at::Tensor>(render_medians)         \
+                            : c10::nullopt,                                    \
+            render_geometry ? at::optional<at::Tensor>(normal_length)          \
+                            : c10::nullopt,                                    \
+            render_geometry ? at::optional<at::Tensor>(median_ids)             \
+                            : c10::nullopt                                     \
         );                                                                     \
         break;
 
@@ -240,7 +190,182 @@ rasterize_to_pixels_3dgs_bwd(
 #undef __LAUNCH_KERNEL__
 
     return std::make_tuple(
-        v_means2d_abs, v_means2d, v_conics, v_colors, v_opacities
+        renders,
+        alphas,
+        last_ids,
+        render_normals,
+        render_depths,
+        render_medians,
+        normal_length,
+        median_ids
+    );
+}
+
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_3dgs_bwd(
+    // Gaussian parameters
+    const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
+    const at::Tensor conics,                    // [..., N, 3] or [nnz, 3]
+    const at::Tensor colors,                    // [..., N, channels] or [nnz, channels]
+    const at::Tensor opacities,                 // [..., N] or [nnz]
+    const at::optional<at::Tensor> backgrounds, // [..., channels]
+    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // forward outputs
+    const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor last_ids,      // [..., image_height, image_width]
+    // gradients of outputs
+    const at::Tensor v_render_colors, // [..., image_height, image_width, channels]
+    const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
+    // options
+    bool absgrad,
+    // geometry rendering (RD/PD/MD/WD)
+    const bool render_geometry,
+    const at::optional<at::Tensor> ray_planes,
+    const at::optional<at::Tensor> normals,
+    const at::optional<at::Tensor> Ks,
+    const at::optional<at::Tensor> render_normals,
+    const at::optional<at::Tensor> render_depths,
+    const at::optional<at::Tensor> normal_length,
+    const at::optional<at::Tensor> median_ids,
+    const at::optional<at::Tensor> v_render_normals,
+    const at::optional<at::Tensor> v_render_depths,
+    const at::optional<at::Tensor> v_render_medians
+) {
+    DEVICE_GUARD(means2d);
+    CHECK_INPUT(means2d);
+    CHECK_INPUT(conics);
+    CHECK_INPUT(colors);
+    CHECK_INPUT(opacities);
+    CHECK_INPUT(tile_offsets);
+    CHECK_INPUT(flatten_ids);
+    CHECK_INPUT(render_alphas);
+    CHECK_INPUT(last_ids);
+    CHECK_INPUT(v_render_colors);
+    CHECK_INPUT(v_render_alphas);
+    if (backgrounds.has_value()) {
+        CHECK_INPUT(backgrounds.value());
+    }
+    if (masks.has_value()) {
+        CHECK_INPUT(masks.value());
+    }
+
+    uint32_t channels = colors.size(-1);
+
+    at::Tensor v_means2d = at::zeros_like(means2d);
+    at::Tensor v_conics = at::zeros_like(conics);
+    at::Tensor v_colors = at::zeros_like(colors);
+    at::Tensor v_opacities = at::zeros_like(opacities);
+    at::Tensor v_means2d_abs;
+    if (absgrad) {
+        v_means2d_abs = at::zeros_like(means2d);
+    }
+
+    // Geometry grad outputs (0-size when disabled; zeros because atomicAdd)
+    at::Tensor v_ray_planes = at::empty({0}, means2d.options());
+    at::Tensor v_normals = at::empty({0}, means2d.options());
+    if (render_geometry) {
+        TORCH_CHECK(
+            ray_planes.has_value() && normals.has_value() && Ks.has_value() &&
+                render_normals.has_value() && render_depths.has_value() &&
+                normal_length.has_value() && median_ids.has_value() &&
+                v_render_normals.has_value() && v_render_depths.has_value(),
+            "render_geometry backward requires the geometry fwd tensors"
+        );
+        v_ray_planes = at::zeros_like(ray_planes.value());
+        v_normals = at::zeros_like(normals.value());
+    }
+
+#define __LAUNCH_KERNEL__(N)                                                   \
+    case N:                                                                    \
+        launch_rasterize_to_pixels_3dgs_bwd_kernel<N>(                         \
+            means2d,                                                           \
+            conics,                                                            \
+            colors,                                                            \
+            opacities,                                                         \
+            backgrounds,                                                       \
+            masks,                                                             \
+            image_width,                                                       \
+            image_height,                                                      \
+            tile_size,                                                         \
+            tile_offsets,                                                      \
+            flatten_ids,                                                       \
+            render_alphas,                                                     \
+            last_ids,                                                          \
+            v_render_colors,                                                   \
+            v_render_alphas,                                                   \
+            absgrad ? c10::optional<at::Tensor>(v_means2d_abs) : c10::nullopt, \
+            v_means2d,                                                         \
+            v_conics,                                                          \
+            v_colors,                                                          \
+            v_opacities,                                                       \
+            render_geometry,                                                   \
+            ray_planes,                                                        \
+            normals,                                                           \
+            Ks,                                                                \
+            render_normals,                                                    \
+            render_depths,                                                     \
+            normal_length,                                                     \
+            median_ids,                                                        \
+            v_render_normals,                                                  \
+            v_render_depths,                                                   \
+            v_render_medians,                                                  \
+            render_geometry ? at::optional<at::Tensor>(v_ray_planes)           \
+                            : c10::nullopt,                                    \
+            render_geometry ? at::optional<at::Tensor>(v_normals)              \
+                            : c10::nullopt                                     \
+        );                                                                     \
+        break;
+
+    // TODO: an optimization can be done by passing the actual number of
+    // channels into the kernel functions and avoid necessary global memory
+    // writes. This requires moving the channel padding from python to C side.
+    switch (channels) {
+        __LAUNCH_KERNEL__(1)
+        __LAUNCH_KERNEL__(2)
+        __LAUNCH_KERNEL__(3)
+        __LAUNCH_KERNEL__(4)
+        __LAUNCH_KERNEL__(5)
+        __LAUNCH_KERNEL__(8)
+        __LAUNCH_KERNEL__(9)
+        __LAUNCH_KERNEL__(16)
+        __LAUNCH_KERNEL__(17)
+        __LAUNCH_KERNEL__(32)
+        __LAUNCH_KERNEL__(33)
+        __LAUNCH_KERNEL__(64)
+        __LAUNCH_KERNEL__(65)
+        __LAUNCH_KERNEL__(128)
+        __LAUNCH_KERNEL__(129)
+        __LAUNCH_KERNEL__(256)
+        __LAUNCH_KERNEL__(257)
+        __LAUNCH_KERNEL__(512)
+        __LAUNCH_KERNEL__(513)
+    default:
+        AT_ERROR("Unsupported number of channels: ", channels);
+    }
+#undef __LAUNCH_KERNEL__
+
+    return std::make_tuple(
+        v_means2d_abs,
+        v_means2d,
+        v_conics,
+        v_colors,
+        v_opacities,
+        v_ray_planes,
+        v_normals
     );
 }
 
