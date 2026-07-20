@@ -429,7 +429,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     gpuAtomicAdd(v_ray_ptr, v_ray_plane_local.x);
                     gpuAtomicAdd(v_ray_ptr + 1, v_ray_plane_local.y);
                     gpuAtomicAdd(v_ray_ptr + 2, v_ray_plane_local.z);
-                    // v_ray_planes[.w] (rsigma) has no gradient path in RD
+                    // v_ray_planes[.w] (rsigma) has no gradient path in the mean reduction
                     float *v_nrm_ptr = (float *)(v_normals) + 3 * g;
                     gpuAtomicAdd(v_nrm_ptr, v_normal_local.x);
                     gpuAtomicAdd(v_nrm_ptr + 1, v_normal_local.y);
@@ -468,7 +468,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     at::Tensor v_conics,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_opacities,                 // [..., N] or [nnz]
-    // geometry rendering (RD/PD/MD/WD); ignored unless render_geometry
+    // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals_in,
@@ -588,7 +588,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             __RD_BWD_LAUNCH__(true);
         } else {
             AT_ERROR(
-                "render_geometry (RD/MD/WD) requires 3 color channels, got ",
+                "render_geometry requires 3 color channels, got ",
                 CDIM
             );
         }

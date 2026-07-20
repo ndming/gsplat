@@ -737,7 +737,7 @@ def rasterization(
 
     # Rasterize to pixels. ZD appends the per-Gaussian z-depth as one channel;
     # the expected depth will be derived after rasterization.
-    # RD/PD/MD/WD compute depth/normal inside the geometry kernel.
+    # Geometry modes compute depth/normal inside the geometry kernel.
     if render_mode == "RGB+ZD":
         colors = torch.cat((colors, depths[..., None]), dim=-1)
         if backgrounds is not None:
@@ -752,7 +752,7 @@ def rasterization(
         colors = depths[..., None]
         if backgrounds is not None:
             backgrounds = torch.zeros(batch_dims + (C, 1), device=backgrounds.device)
-    else:  # RGB, RGB+RD/PD/MD/WD
+    else:  # RGB, or a geometry mode (depth/normal produced in the kernel)
         pass
 
     # Identify intersecting tiles

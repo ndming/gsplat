@@ -408,7 +408,7 @@ def fully_fused_projection(
         assert packed, "sparse_grad is only supported when packed is True"
         assert batch_dims == (), "sparse_grad does not support batch dimensions"
     if render_geometry:
-        assert not packed, "render_geometry (RD/PD/MD/WD) is not supported in packed mode"
+        assert not packed, "render_geometry is not supported in packed mode"
         assert covars is None, "render_geometry requires quats/scales, not covars"
     if opacities is not None:
         assert opacities.shape == batch_dims + (N,), opacities.shape
@@ -582,6 +582,7 @@ def rasterize_to_pixels(
     normals: Optional[Tensor] = None,  # [..., N, 3]
     Ks: Optional[Tensor] = None,  # [..., 3, 3]
     render_geometry: bool = False,
+    reduction: int = 0,  # median flavor: 0 = T>0.5 crossing, 1 = opacity-volume
 ) -> Tuple[Tensor, ...]:
     """Rasterizes Gaussians to pixels.
 
@@ -685,7 +686,7 @@ def rasterize_to_pixels(
 
     if render_geometry:
         assert padded_channels == 0 and channels == 3, (
-            "render_geometry (RD/PD/MD/WD) requires exactly 3 color channels"
+            "render_geometry requires exactly 3 color channels"
         )
         assert (
             ray_planes is not None and normals is not None and Ks is not None
@@ -714,6 +715,7 @@ def rasterize_to_pixels(
         normals.contiguous() if normals is not None else None,
         Ks.contiguous() if Ks is not None else None,
         render_geometry,
+        reduction,
     )
 
     if padded_channels > 0:
@@ -1347,6 +1349,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         normals: Optional[Tensor],  # [..., N, 3]
         Ks: Optional[Tensor],  # [..., 3, 3]
         render_geometry: bool,
+        reduction: int,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         (
             render_colors,
@@ -1370,6 +1373,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             render_geometry,
+            reduction,
             ray_planes,
             normals,
             Ks,
@@ -1505,6 +1509,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_normals if render_geometry else None,      # normals
             None,  # Ks
             None,  # render_geometry
+            None,  # reduction
         )
 
 

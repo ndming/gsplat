@@ -58,8 +58,9 @@ rasterize_to_pixels_3dgs_fwd(
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
-    // geometry rendering (RD/PD/MD/WD)
+    // geometry outputs
     const bool render_geometry,
+    const uint32_t reduction,                  // median flavor: 0=crossing, 1=opacity-volume
     const at::optional<at::Tensor> ray_planes, // [..., N, 4]
     const at::optional<at::Tensor> normals,    // [..., N, 3]
     const at::optional<at::Tensor> Ks          // [..., 3, 3]
@@ -145,6 +146,7 @@ rasterize_to_pixels_3dgs_fwd(
             alphas,                                                            \
             last_ids,                                                          \
             render_geometry,                                                   \
+            reduction,                                                         \
             ray_planes,                                                        \
             normals,                                                           \
             Ks,                                                                \

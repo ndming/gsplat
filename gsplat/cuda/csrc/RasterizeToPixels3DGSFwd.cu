@@ -31,7 +31,12 @@ namespace cg = cooperative_groups;
 // Forward
 ////////////////////////////////////////////////////////////////
 
-template <uint32_t CDIM, bool GEOMETRY, typename scalar_t>
+// MEDIAN selects the median-depth reduction written to render_medians:
+//   false -> depth of the T>0.5 transmittance crossing (cheap; the default)
+//   true  -> opacity-volume level-set median (block-cooperative binary search
+//            over the per-Gaussian ray spread rsigma = ray_plane.w)
+// MEDIAN implies GEOMETRY. The expected depth and normal are always produced.
+template <uint32_t CDIM, bool GEOMETRY, bool MEDIAN, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t I,
     const uint32_t N,
@@ -176,6 +181,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     float median_depth = 0.f;   // ray-distance depth of the T>0.5 crossing splat
     float normal_acc[3] = {0.f, 0.f, 0.f};
     int32_t median_idx = 0;
+    // 1-based ordinal (within this tile's range) of the last contributing splat;
+    // only tracked/used by the opacity-volume median reduction.
+    uint32_t last_contributor = 0;
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -256,9 +264,114 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
                 }
             }
             cur_idx = batch_start + t;
+            if constexpr (MEDIAN) {
+                last_contributor = cur_idx - range_start + 1;
+            }
 
             T = next_T;
         }
+    }
+
+    // Opacity-volume level-set median (block-cooperative). Runs for every thread
+    // so the shared-memory reloads and block syncs stay collective. Works in
+    // ray-distance; converted to z-depth (via rln) at write time.
+    float oav_median = 0.f;
+    if constexpr (GEOMETRY && MEDIAN) {
+        constexpr int OAV_SPLIT = 8;         // sub-intervals per refinement
+        constexpr int OAV_ITERS = 5;         // refinement iterations
+        constexpr float OAV_RANGE = 0.4f;    // initial +/- search window (ray-dist)
+        constexpr float OAV_MIN_T = 0.45f;   // pixel must be opaque enough
+
+        // Max contributing count across the tile bounds the re-iteration.
+        __shared__ uint32_t s_block_max;
+        if (tr == 0) {
+            s_block_max = 0u;
+        }
+        block.sync();
+        atomicMax(&s_block_max, last_contributor);
+        block.sync();
+        const uint32_t max_contributor = s_block_max;
+        const uint32_t oav_rounds =
+            (max_contributor + block_size - 1) / block_size;
+
+        // Seed the window at the T>0.5 crossing depth (ray-distance).
+        float depth_min = fmaxf(median_depth - OAV_RANGE, 0.f);
+        float depth_max = fmaxf(median_depth + OAV_RANGE, 0.f);
+        bool in_range = T <= OAV_MIN_T;
+        float T_p[OAV_SPLIT + 1];
+
+        for (int it = 0; it < OAV_ITERS; ++it) {
+            const bool first = (it == 0);
+            const int s_lo = first ? 0 : 1;           // inclusive
+            const int s_hi = first ? OAV_SPLIT + 1 : OAV_SPLIT; // exclusive
+            for (int s = s_lo; s < s_hi; ++s) {
+                T_p[s] = 1.f;
+            }
+            const float interval = (depth_max - depth_min) / (float)OAV_SPLIT;
+            bool rdone = !in_range;
+            uint32_t contributor = 0;
+            int toDo = (int)max_contributor;
+            for (uint32_t r = 0; r < oav_rounds; ++r, toDo -= block_size) {
+                block.sync();
+                const uint32_t progress = r * block_size + tr;
+                if (progress < max_contributor) {
+                    int32_t g = flatten_ids[range_start + progress];
+                    const vec2 xy = means2d[g];
+                    xy_opacity_batch[tr] = {xy.x, xy.y, opacities[g]};
+                    conic_batch[tr] = conics[g];
+                    ray_plane_batch[tr] = {
+                        ray_planes[g * 4], ray_planes[g * 4 + 1],
+                        ray_planes[g * 4 + 2], ray_planes[g * 4 + 3]
+                    };
+                }
+                block.sync();
+                const int bsz = min((int)block_size, toDo);
+                for (int t = 0; !rdone && t < bsz; ++t) {
+                    contributor++;
+                    rdone = contributor >= last_contributor;
+                    const vec3 xy_opac = xy_opacity_batch[t];
+                    const vec2 delta = {xy_opac.x - px, xy_opac.y - py};
+                    const vec3 conic = conic_batch[t];
+                    const float sigma = 0.5f * (conic.x * delta.x * delta.x +
+                                                conic.z * delta.y * delta.y) +
+                                        conic.y * delta.x * delta.y;
+                    if (sigma < 0.f) {
+                        continue;
+                    }
+                    const float alpha = min(0.999f, xy_opac.z * __expf(-sigma));
+                    if (alpha < ALPHA_THRESHOLD) {
+                        continue;
+                    }
+                    const vec4 rp = ray_plane_batch[t];
+                    const float t_peak = rp.x * delta.x + rp.y * delta.y + rp.z;
+                    const float rsigma = rp.w;
+                    const bool ball = rsigma > 0.f;
+                    for (int s = s_lo; s < s_hi; ++s) {
+                        const float ts = depth_min + interval * s;
+                        const float dl = (ts - t_peak) * rsigma;
+                        const float gg = ball ? __expf(-0.5f * dl * dl) : 0.f;
+                        const float omg = 1.f - alpha * gg;
+                        const float rvac = rsqrtf(omg);
+                        T_p[s] *= (ts > t_peak ? (1.f - alpha) : omg) * rvac;
+                    }
+                }
+            }
+            if (first) {
+                in_range = (T_p[0] >= 0.5f) && (T_p[OAV_SPLIT] <= 0.5f) && in_range;
+            }
+            int sid = 0;
+            for (int p = 1; p < OAV_SPLIT; ++p) {
+                sid = (T_p[p] >= 0.5f) ? p : sid;
+            }
+            depth_max = depth_min + (sid + 1) * interval;
+            depth_min = depth_min + (sid + 0) * interval;
+            T_p[0] = T_p[sid];
+            T_p[OAV_SPLIT] = T_p[sid + 1];
+        }
+        const float w_max =
+            __saturatef((T_p[0] - 0.5f) / (T_p[0] - T_p[OAV_SPLIT]));
+        const float w_min = 1.f - w_max;
+        oav_median = in_range ? (w_max * depth_max + w_min * depth_min) : 0.f;
     }
 
     if (inside) {
@@ -279,12 +392,17 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
 
         if constexpr (GEOMETRY) {
             const float alpha_pix = 1.0f - T;
-            // Expected z-depth (RD): alpha-weighted mean plane depth, then
+            // Expected z-depth: alpha-weighted mean plane depth, then
             // ray-distance -> z via rln.
             render_depths[pix_id] =
                 alpha_pix > 1e-6f ? (depth_acc * rln) / alpha_pix : 0.f;
-            // Median z-depth (informational for RD; MD will refine this).
-            render_medians[pix_id] = median_depth * rln;
+            // Median z-depth: opacity-volume level-set when MEDIAN, else the
+            // depth of the T>0.5 crossing splat.
+            if constexpr (MEDIAN) {
+                render_medians[pix_id] = oav_median * rln;
+            } else {
+                render_medians[pix_id] = median_depth * rln;
+            }
             const float nlen = sqrtf(
                 normal_acc[0] * normal_acc[0] + normal_acc[1] * normal_acc[1] +
                 normal_acc[2] * normal_acc[2]
@@ -319,8 +437,9 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::Tensor renders, // [..., image_height, image_width, channels]
     at::Tensor alphas,  // [..., image_height, image_width]
     at::Tensor last_ids, // [..., image_height, image_width]
-    // geometry rendering (RD/PD/MD/WD); ignored unless render_geometry
+    // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
+    const uint32_t reduction,                      // median flavor: 0=crossing, 1=opacity-volume
     const at::optional<at::Tensor> ray_planes,     // [..., N, 4]
     const at::optional<at::Tensor> normals_in,     // [..., N, 3]
     const at::optional<at::Tensor> Ks,             // [..., 3, 3]
@@ -370,10 +489,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
     // writes. This requires moving the channel padding from python to C side.
-#define __RD_LAUNCH__(GEOM)                                                    \
+#define __RD_LAUNCH__(GEOM, MED)                                               \
     do {                                                                       \
         if (cudaFuncSetAttribute(                                              \
-                rasterize_to_pixels_3dgs_fwd_kernel<CDIM, GEOM, float>,        \
+                rasterize_to_pixels_3dgs_fwd_kernel<CDIM, GEOM, MED, float>,   \
                 cudaFuncAttributeMaxDynamicSharedMemorySize,                   \
                 shmem_size) != cudaSuccess) {                                  \
             AT_ERROR(                                                          \
@@ -382,7 +501,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
                 " bytes), try lowering tile_size."                             \
             );                                                                 \
         }                                                                      \
-        rasterize_to_pixels_3dgs_fwd_kernel<CDIM, GEOM, float>                 \
+        rasterize_to_pixels_3dgs_fwd_kernel<CDIM, GEOM, MED, float>            \
             <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>( \
                 I,                                                             \
                 N,                                                            \
@@ -420,15 +539,19 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     if (render_geometry) {
         // Geometry rendering is only compiled/allowed for RGB (3 channels).
         if constexpr (CDIM == 3) {
-            __RD_LAUNCH__(true);
+            if (reduction == 1) {
+                __RD_LAUNCH__(true, true);
+            } else {
+                __RD_LAUNCH__(true, false);
+            }
         } else {
             AT_ERROR(
-                "render_geometry (RD/MD/WD) requires 3 color channels, got ",
+                "render_geometry requires 3 color channels, got ",
                 CDIM
             );
         }
     } else {
-        __RD_LAUNCH__(false);
+        __RD_LAUNCH__(false, false);
     }
 #undef __RD_LAUNCH__
 }
@@ -453,6 +576,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         at::Tensor alphas,                                                     \
         at::Tensor last_ids,                                                   \
         const bool render_geometry,                                            \
+        const uint32_t reduction,                                              \
         const at::optional<at::Tensor> ray_planes,                             \
         const at::optional<at::Tensor> normals_in,                             \
         const at::optional<at::Tensor> Ks,                                     \

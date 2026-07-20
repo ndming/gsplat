@@ -52,8 +52,9 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::Tensor renders, // [..., image_height, image_width, channels]
     at::Tensor alphas,  // [..., image_height, image_width]
     at::Tensor last_ids, // [..., image_height, image_width]
-    // geometry rendering (RD/PD/MD/WD); ignored unless render_geometry
+    // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
+    const uint32_t reduction,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals_in,
     const at::optional<at::Tensor> Ks,

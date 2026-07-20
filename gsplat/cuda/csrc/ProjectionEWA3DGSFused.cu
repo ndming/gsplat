@@ -30,16 +30,15 @@ namespace gsplat {
 namespace cg = cooperative_groups;
 
 // ---------------------------------------------------------------------------
-// RaDe-GS geometry: per-Gaussian depth-plane coefficients and camera-space
-// normal. Kept close to HKUST-SAIL/RaDe-GS `computeCov2D` so the math stays
-// cross-checkable. The depth of the Gaussian's tangent plane along the ray
-// through pixel offset d = (mean2d - pix) is  t = rp.x*d.x + rp.y*d.y + rp.z,
-// with rp.z = tc (ray distance to the center) and rp.w = rsigma (used only by
-// the GGGS median, not by RD). `W` is the world->camera rotation (gsplat's `R`).
+// Per-Gaussian depth-plane coefficients and camera-space normal. The depth of
+// the Gaussian's tangent plane along the ray through pixel offset
+// d = (mean2d - pix) is  t = rp.x*d.x + rp.y*d.y + rp.z, with rp.z = tc (ray
+// distance to the center) and rp.w = rsigma (per-Gaussian spread along the ray,
+// consumed only by the opacity-volume median reduction).
 // ---------------------------------------------------------------------------
 inline __device__ void compute_ray_plane_normal(
     const vec3 mean_c,
-    const mat3 W,     // TRANSPOSED world->camera rotation (RaDe glm convention;
+    const mat3 W,     // TRANSPOSED world->camera rotation (glm column-major
                       // = glm::transpose(gsplat W2C rotation)). See call sites.
     const vec4 quat,  // [w, x, y, z], unnormalized
     const vec3 scale, // per-axis scale (already activated)
@@ -57,8 +56,8 @@ inline __device__ void compute_ray_plane_normal(
     const float sx = scale[0], sy = scale[1], sz = scale[2];
     mat3 S_inv = mat3(1.f / sx, 0.f, 0.f, 0.f, 1.f / sy, 0.f, 0.f, 0.f, 1.f / sz);
 
-    // rotation from the normalized quaternion (RaDe column-major convention;
-    // NOT gsplat's quat_to_rotmat, which is the transpose)
+    // rotation from the normalized quaternion (column-major convention;
+    // NOT gsplat's quat_to_rotmat, which is the transpose of this)
     const float qn =
         rsqrtf(quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2] + quat[3] * quat[3]);
     const float r = quat[0] * qn, x = quat[1] * qn, y = quat[2] * qn, z = quat[3] * qn;
@@ -118,10 +117,10 @@ inline __device__ void compute_ray_plane_normal(
 }
 
 // ---------------------------------------------------------------------------
-// VJP of compute_ray_plane_normal. Ported from HKUST-SAIL/RaDe-GS
-// computeCov2DCUDA (scales branch, geometry-only parts: no conic/coef path,
-// no frustum clamp to match the forward here). Produces the geometry
-// contributions to {mean_c, scale, quat_raw}. `W` is world->camera rotation.
+// VJP of compute_ray_plane_normal (geometry-only: no conic/coef path, no
+// frustum clamp, to match the forward here). Produces the geometry
+// contributions to {mean_c, scale, quat_raw}. `W` is the transposed
+// world->camera rotation (see the forward).
 // ---------------------------------------------------------------------------
 inline __device__ void compute_ray_plane_normal_vjp(
     const vec3 mean_c,
@@ -150,7 +149,7 @@ inline __device__ void compute_ray_plane_normal_vjp(
     const float u = t.x / t.z;
     const float v = t.y / t.z;
 
-    // scaling and rotation (RaDe convention, normalized quaternion)
+    // scaling and rotation (column-major convention, normalized quaternion)
     const float sx = scale[0], sy = scale[1], sz = scale[2];
     mat3 S_inv = mat3(1.f / sx, 0.f, 0.f, 0.f, 1.f / sy, 0.f, 0.f, 0.f, 1.f / sz);
     const float qn = rsqrtf(
@@ -216,14 +215,12 @@ inline __device__ void compute_ray_plane_normal_vjp(
 
         vec3 cam_normal_vector = nJ * ray_normal_vector;
         vec3 normal_vector = glm::normalize(cam_normal_vector);
-        // NOTE: This deliberately mirrors RaDe-GS render_backward.cu:445, which computes
-        // rlv from the ALREADY-normalized normal_vector (so rlv ~= 1), NOT from the raw
-        // cam_normal_vector. The mathematically correct normalize-VJP factor is
-        // 1/|cam_normal_vector| (rsqrtf of the un-normalized vector); RaDe's rlv~=1 drops
-        // that 1/|x|, over-weighting the normal gradient for tilted disks and flattening
-        // them harder. We match RaDe on purpose to reproduce its training dynamics for
-        // surface reconstruction. Re-verify against GGGS source when cloned. See memory
-        // "depth-render-modes-task" (rlv normalize-VJP).
+        // NOTE (deliberate): rlv is taken from the ALREADY-normalized normal_vector
+        // (so rlv ~= 1), NOT from the raw cam_normal_vector. The mathematically correct
+        // normalize-VJP factor is 1/|cam_normal_vector| (rsqrtf of the un-normalized
+        // vector); using ~1 drops that 1/|x|, over-weighting the normal gradient for
+        // tilted disks and flattening them harder. This matches the reference training
+        // dynamics on purpose; see the port notes before "fixing" it.
         const float rlv = rsqrtf(
             normal_vector.x * normal_vector.x +
             normal_vector.y * normal_vector.y +
@@ -310,7 +307,7 @@ inline __device__ void compute_ray_plane_normal_vjp(
     dL_dcov3D[4] = dL_dVrk[1][2] + dL_dVrk[2][1];
     dL_dcov3D[5] = dL_dVrk[2][2];
 
-    // computeCov3D VJP (Vrk = M^T M with M = S*R), RaDe convention
+    // computeCov3D VJP (Vrk = M^T M with M = S*R), column-major convention
     mat3 S = mat3(sx, 0.f, 0.f, 0.f, sy, 0.f, 0.f, 0.f, sz);
     mat3 M = S * R;
     mat3 dL_dSigma = mat3(
@@ -329,7 +326,7 @@ inline __device__ void compute_ray_plane_normal_vjp(
     dL_dMt[2] *= sz;
     dL_dMt[min_id] += dL_dr;
 
-    // dL/d normalized quaternion (RaDe formula)
+    // dL/d normalized quaternion
     vec4 dL_dqn;
     dL_dqn[0] = 2.f * qz * (dL_dMt[0][1] - dL_dMt[1][0]) +
                 2.f * qy * (dL_dMt[2][0] - dL_dMt[0][2]) +
@@ -382,7 +379,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     scalar_t *__restrict__ depths,       // [B, C, N]
     scalar_t *__restrict__ conics,       // [B, C, N, 3]
     scalar_t *__restrict__ compensations,// [B, C, N] optional
-    // geometry rendering (RD/PD/MD/WD), optional
+    // geometry outputs, optional (written only when render_geometry)
     const bool render_geometry,
     scalar_t *__restrict__ ray_planes,   // [B, C, N, 4] optional {gx,gy,tc,rsigma}
     scalar_t *__restrict__ normals       // [B, C, N, 3] optional (camera space)
@@ -559,7 +556,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
         compensations[idx] = compensation;
     }
 
-    // RaDe-GS depth-plane + normal. Only reached when render_geometry is set,
+    // Per-Gaussian depth-plane + normal. Only reached when render_geometry is set,
     // which the caller only allows with {quats, scales} (not precomputed covars),
     // so the advanced quats/scales pointers point to this Gaussian here.
     if (render_geometry) {
@@ -567,11 +564,11 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
         vec3 normal;
         compute_ray_plane_normal(
             mean_c,
-            // RaDe's M_inv = S_inv*R_gaussian*W expects W as the world->camera
-            // rotation in glm column-major form, which equals the TRANSPOSE of
-            // gsplat's R (=W2C rotation). Passing R untransposed leaves depth ~ok
-            // (tc-dominated) but rotates the per-Gaussian normal on general
-            // orientations. Verified: transpose(R) reproduces RaDe's normal exactly.
+            // M_inv = S_inv*R_gaussian*W expects W as the world->camera rotation
+            // in glm column-major form, which equals the TRANSPOSE of gsplat's R
+            // (=W2C rotation). Passing R untransposed leaves depth ~ok (tc-dominated)
+            // but rotates the per-Gaussian normal on general orientations; the
+            // transpose is required. Verified against a full render.
             glm::transpose(R),
             glm::make_vec4(quats),
             glm::make_vec3(scales),
@@ -702,7 +699,7 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     const scalar_t *__restrict__ v_depths,        // [B, C, N]
     const scalar_t *__restrict__ v_conics,        // [B, C, N, 3]
     const scalar_t *__restrict__ v_compensations, // [B, C, N] optional
-    // RaDe-GS geometry grad outputs (read only when non-null)
+    // geometry grad outputs (read only when non-null)
     const scalar_t *__restrict__ v_ray_planes, // [B, C, N, 4] optional
     const scalar_t *__restrict__ v_normals,    // [B, C, N, 3] optional
     // grad inputs
@@ -848,7 +845,7 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     // add contribution from v_depths
     v_mean_c.z += v_depths[0];
 
-    // RaDe-GS geometry VJP: fold depth-plane + normal gradients into the
+    // Geometry VJP: fold depth-plane + normal gradients into the
     // camera-space mean here (transformed to world by posW2C_VJP below) and
     // into scale/quat in the {quats, scales} branch.
     vec3 v_scale_geo(0.f);
@@ -911,7 +908,7 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
         vec4 v_quat(0.f);
         vec3 v_scale(0.f);
         quat_scale_to_covar_vjp(quat, scale, rotmat, v_covar, v_quat, v_scale);
-        // add RaDe-GS geometry (depth-plane + normal) contributions
+        // add geometry (depth-plane + normal) contributions
         v_quat += v_quat_geo;
         v_scale += v_scale_geo;
         warpSum(v_quat, warp_group_g);
