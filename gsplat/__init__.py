@@ -44,6 +44,7 @@ from .rendering import (
     rasterization_2dgs_inria_wrapper,
     rasterization_inria_wrapper,
 )
+from .sampling import sample_geometry
 from .strategy import DefaultStrategy, MCMCStrategy, Strategy
 from .version import __version__
 
@@ -57,6 +58,7 @@ all = [
     "rasterization",
     "rasterization_2dgs",
     "rasterization_inria_wrapper",
+    "sample_geometry",
     "spherical_harmonics",
     "isect_offset_encode",
     "isect_tiles",

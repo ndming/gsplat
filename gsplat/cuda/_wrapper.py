@@ -2737,3 +2737,135 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             None,
             None,
         )
+
+
+def sample_geometry(
+    points2d: Tensor,      # [P, 2] query pixel coords in the camera
+    means2d: Tensor,       # [N, 2]
+    conics: Tensor,        # [N, 3]
+    opacities: Tensor,     # [N]
+    ray_planes: Tensor,    # [N, 4]
+    Ks: Tensor,            # [3, 3]
+    width: int,
+    height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [tile_height, tile_width]
+    flatten_ids: Tensor,    # [n_isects]
+    normals: Optional[Tensor] = None,  # [N, 3]; enables normal sampling when given
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Sample the surface depth (and optionally camera-space normal) at arbitrary
+    query pixels, reusing a precomputed per-tile Gaussian intersection. Differentiable
+    w.r.t. points2d, means2d, conics, opacities, ray_planes, and normals.
+
+    Returns:
+        depth:  [P] sampled surface depth (0 where no coverage / out of image)
+        alpha:  [P] accumulated opacity (1 - T), useful as an inside/validity mask
+        normal: [P, 3] sampled unit normal, or [0] when `normals` is None
+    """
+    return _SampleGeometry.apply(
+        points2d.contiguous(),
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        ray_planes.contiguous(),
+        normals.contiguous() if normals is not None else None,
+        Ks.contiguous(),
+        width,
+        height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+
+
+class _SampleGeometry(torch.autograd.Function):
+    """Autograd wrapper for the geometry-sampling op."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        points2d: Tensor,
+        means2d: Tensor,
+        conics: Tensor,
+        opacities: Tensor,
+        ray_planes: Tensor,
+        normals: Optional[Tensor],
+        Ks: Tensor,
+        width: int,
+        height: int,
+        tile_size: int,
+        isect_offsets: Tensor,
+        flatten_ids: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        sample_normals = normals is not None
+        depth, alpha, normal = _make_lazy_cuda_func("sample_geometry_3dgs_fwd")(
+            points2d,
+            means2d,
+            conics,
+            opacities,
+            ray_planes,
+            normals,
+            Ks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            sample_normals,
+        )
+        ctx.save_for_backward(
+            points2d, means2d, conics, opacities, ray_planes, normals, Ks,
+            isect_offsets, flatten_ids,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.tile_size = tile_size
+        ctx.sample_normals = sample_normals
+        return depth, alpha, normal
+
+    @staticmethod
+    def backward(ctx, v_depth: Tensor, v_alpha: Tensor, v_normal: Tensor):
+        (
+            points2d, means2d, conics, opacities, ray_planes, normals, Ks,
+            isect_offsets, flatten_ids,
+        ) = ctx.saved_tensors
+        sample_normals = ctx.sample_normals
+        v_depth = v_depth.contiguous()
+        v_alpha = v_alpha.contiguous()
+        v_normal = v_normal.contiguous() if sample_normals else None
+
+        (
+            v_means2d, v_conics, v_opacities, v_ray_planes, v_normals, v_points2d,
+        ) = _make_lazy_cuda_func("sample_geometry_3dgs_bwd")(
+            points2d,
+            means2d,
+            conics,
+            opacities,
+            ray_planes,
+            normals,
+            Ks,
+            ctx.width,
+            ctx.height,
+            ctx.tile_size,
+            isect_offsets,
+            flatten_ids,
+            sample_normals,
+            v_depth,
+            v_alpha,
+            v_normal,
+        )
+        # Grads match the forward inputs; non-differentiable inputs get None.
+        return (
+            v_points2d,                                # points2d
+            v_means2d,                                 # means2d
+            v_conics,                                  # conics
+            v_opacities,                               # opacities
+            v_ray_planes,                              # ray_planes
+            v_normals if sample_normals else None,     # normals
+            None,                                      # Ks
+            None,                                      # width
+            None,                                      # height
+            None,                                      # tile_size
+            None,                                      # isect_offsets
+            None,                                      # flatten_ids
+        )

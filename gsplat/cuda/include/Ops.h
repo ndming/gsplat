@@ -317,6 +317,43 @@ rasterize_to_pixels_3dgs_bwd(
     const at::optional<at::Tensor> v_render_medians
 );
 
+// Sample geometry at arbitrary query pixels, reusing an existing per-tile Gaussian intersection.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> sample_geometry_3dgs_fwd(
+    const at::Tensor points2d,   // [P, 2] query pixel coords (this camera)
+    const at::Tensor means2d,    // [N, 2]
+    const at::Tensor conics,     // [N, 3]
+    const at::Tensor opacities,  // [N]
+    const at::Tensor ray_planes, // [N, 4]
+    const at::optional<at::Tensor> normals, // [N, 3]
+    const at::Tensor Ks,         // [3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    const bool sample_normals
+);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+sample_geometry_3dgs_bwd(
+    const at::Tensor points2d,
+    const at::Tensor means2d,
+    const at::Tensor conics,
+    const at::Tensor opacities,
+    const at::Tensor ray_planes,
+    const at::optional<at::Tensor> normals,
+    const at::Tensor Ks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets,
+    const at::Tensor flatten_ids,
+    const bool sample_normals,
+    const at::Tensor v_depth,
+    const at::Tensor v_alpha,
+    const at::optional<at::Tensor> v_normal
+);
+
 // Rasterize 3D Gaussian, but only return the indices of gaussians and pixels.
 std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs(
     const uint32_t range_start,
