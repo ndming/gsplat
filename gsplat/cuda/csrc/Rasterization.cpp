@@ -234,13 +234,15 @@ rasterize_to_pixels_3dgs_bwd(
     const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
     // options
     bool absgrad,
-    // geometry rendering (RD/PD/MD/WD)
+    // geometry outputs
     const bool render_geometry,
+    const uint32_t reduction,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals,
     const at::optional<at::Tensor> Ks,
     const at::optional<at::Tensor> render_normals,
     const at::optional<at::Tensor> render_depths,
+    const at::optional<at::Tensor> render_medians,
     const at::optional<at::Tensor> normal_length,
     const at::optional<at::Tensor> median_ids,
     const at::optional<at::Tensor> v_render_normals,
@@ -315,11 +317,13 @@ rasterize_to_pixels_3dgs_bwd(
             v_colors,                                                          \
             v_opacities,                                                       \
             render_geometry,                                                   \
+            reduction,                                                         \
             ray_planes,                                                        \
             normals,                                                           \
             Ks,                                                                \
             render_normals,                                                    \
             render_depths,                                                     \
+            render_medians,                                                    \
             normal_length,                                                     \
             median_ids,                                                        \
             v_render_normals,                                                  \

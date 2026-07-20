@@ -38,7 +38,10 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
-template <bool SAMPLE_NORMALS, typename scalar_t>
+// MEDIAN: the sampled depth was the opacity-volume level-set median (not the
+// expected mean), so its gradient is the implicit-function-theorem one (needs
+// the forward median via out_depth). MEDIAN implies the depth channel is median.
+template <bool SAMPLE_NORMALS, bool MEDIAN, typename scalar_t>
 __global__ void sample_geometry_3dgs_bwd_kernel(
     const uint32_t P,
     const uint32_t N,
@@ -57,6 +60,7 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
     const int32_t *__restrict__ tile_offsets, // [tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     const uint32_t n_isects,
+    const scalar_t *__restrict__ out_depth, // [P] forward median z-depth (MEDIAN)
     // upstream gradients
     const scalar_t *__restrict__ v_depth,  // [P]
     const scalar_t *__restrict__ v_alpha,  // [P]
@@ -137,11 +141,49 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
     // ---- upstream grads -> internal accumulators ----
     const float gd = v_depth[p];
     const float ga = v_alpha[p];
-    // depth = D * rln / A ; A = 1 - T_final
-    const float dL_dpixel_t = gd * rln / A;              // grad on D
-    const float v_depth_finalT = gd * d_out / A;         // routed through T_final
-    // grad on rln (-> query pixel)
-    const float grln = gd * D / A;
+    // Expected-depth channel = D * rln / A. Only active for the mean reduction;
+    // for MEDIAN the depth output is the level-set median, handled separately.
+    float dL_dpixel_t = 0.f;    // grad on D (expected)
+    float v_depth_finalT = 0.f; // expected depth routed through T_final
+    float grln = 0.f;           // grad on rln (-> query pixel)
+    float mDepth = 0.f;         // MEDIAN: forward median in ray-distance
+    float dL_dmt_dT_dtm = 0.f;  // MEDIAN: dL/d(median) / (-dT/d ts)
+    if constexpr (MEDIAN) {
+        const float inv_rln = rln > 1e-8f ? 1.f / rln : 0.f;
+        mDepth = out_depth[p] * inv_rln; // z -> ray-distance
+        grln = gd * mDepth;              // out_depth = mDepth * rln
+        if (mDepth > 0.f) {
+            // dT/dts at the median: per-point, over this pixel's contributors
+            float dT_dtm = 0.f;
+            for (int32_t k = start; k < k_stop; ++k) {
+                const int32_t g = flatten_ids[k];
+                const vec2 delta = {means2d[g].x - px, means2d[g].y - py};
+                const vec3 con = conics[g];
+                const float sigma = 0.5f * (con.x * delta.x * delta.x +
+                                            con.z * delta.y * delta.y) +
+                                    con.y * delta.x * delta.y;
+                if (sigma < 0.f) {
+                    continue;
+                }
+                const float alpha = min(0.999f, opacities[g] * __expf(-sigma));
+                if (alpha < ALPHA_THRESHOLD) {
+                    continue;
+                }
+                const vec4 rp = ray_planes[g];
+                const float t_peak = rp.x * delta.x + rp.y * delta.y + rp.z;
+                const float rsigma = rp.w;
+                const float t_delta = (mDepth - t_peak) * rsigma;
+                const float G_exp = __expf(-0.5f * t_delta * t_delta);
+                const float Gt = alpha * G_exp;
+                dT_dtm += -0.25f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+            }
+            dL_dmt_dT_dtm = gd * rln / fmaxf(-dT_dtm, 1e-7f); // dL_dpixel_mt / (-dT_dtm)
+        }
+    } else {
+        dL_dpixel_t = gd * rln / A;
+        v_depth_finalT = gd * d_out / A;
+        grln = gd * D / A;
+    }
 
     // normal normalization VJP (only when sampling normals)
     float dL_dpixel_normal[3] = {0.f, 0.f, 0.f};
@@ -185,14 +227,33 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
         const vec4 rp = ray_planes[g];
         const float tt = rp.x * delta.x + rp.y * delta.y + rp.z;
 
-        // dL/dalpha from depth channel + T_final routing + alpha output
+        // dL/dalpha from depth channel + T_final routing + alpha output.
+        // For MEDIAN the expected terms vanish (dL_dpixel_t = v_depth_finalT = 0).
         float v_a = (tt * Tb - buffer_t * ra) * dL_dpixel_t;
         v_a += -T_final * ra * v_depth_finalT;
         v_a += T_final * ra * ga;
 
         // plane-depth grad (ray_plane + moves the 2D mean)
-        const float dL_dt = w * dL_dpixel_t;
-        vec4 v_rp_local = {dL_dt * delta.x, dL_dt * delta.y, dL_dt, 0.f};
+        float dL_dt = w * dL_dpixel_t; // expected (0 when MEDIAN)
+        float v_rsigma = 0.f;
+        if constexpr (MEDIAN) {
+            // Opacity-volume median: implicit-function-theorem grad at mDepth.
+            const float rsigma = rp.w;
+            const float t_delta = (mDepth - tt) * rsigma;
+            const float G_exp = __expf(-0.5f * t_delta * t_delta);
+            const float Gt = alpha * G_exp;
+            float dL_dGt = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
+            dL_dGt = (mDepth > tt) ? dL_dGt : -dL_dGt;
+            dL_dGt = (rsigma > 0.f) ? dL_dGt : 0.f;
+            const float dL_dopa_sigma =
+                dL_dGt * G_exp -
+                dL_dmt_dT_dtm * (t_delta > 0.f ? 0.5f / (1.f - alpha) : 0.f);
+            const float dL_ddelta = -dL_dGt * Gt * t_delta;
+            v_rsigma = dL_ddelta * (mDepth - tt);
+            dL_dt += -dL_ddelta * rsigma; // dL/dt_peak
+            v_a += dL_dopa_sigma;
+        }
+        vec4 v_rp_local = {dL_dt * delta.x, dL_dt * delta.y, dL_dt, v_rsigma};
         vec2 v_xy = {dL_dt * rp.x, dL_dt * rp.y};
 
         vec3 v_n_local = {0.f, 0.f, 0.f};
@@ -231,6 +292,9 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
         atomicAdd(&v_ray_planes[g].x, v_rp_local.x);
         atomicAdd(&v_ray_planes[g].y, v_rp_local.y);
         atomicAdd(&v_ray_planes[g].z, v_rp_local.z);
+        if constexpr (MEDIAN) {
+            atomicAdd(&v_ray_planes[g].w, v_rp_local.w);
+        }
         if constexpr (SAMPLE_NORMALS) {
             atomicAdd(&v_normals[g].x, v_n_local.x);
             atomicAdd(&v_normals[g].y, v_n_local.y);
@@ -268,6 +332,8 @@ void launch_sample_geometry_3dgs_bwd_kernel(
     const at::Tensor tile_offsets,
     const at::Tensor flatten_ids,
     const bool sample_normals,
+    const bool median,
+    const at::optional<at::Tensor> out_depth,
     const at::Tensor v_depth,
     const at::Tensor v_alpha,
     const at::optional<at::Tensor> v_normal,
@@ -303,9 +369,16 @@ void launch_sample_geometry_3dgs_bwd_kernel(
                 sample_normals
                     ? reinterpret_cast<vec3 *>(v_normals.value().data_ptr<scalar_t>())
                     : nullptr;
-            auto fn = sample_normals
-                          ? sample_geometry_3dgs_bwd_kernel<true, scalar_t>
-                          : sample_geometry_3dgs_bwd_kernel<false, scalar_t>;
+            const scalar_t *out_depth_ptr =
+                median ? out_depth.value().data_ptr<scalar_t>() : nullptr;
+            auto fn =
+                median
+                    ? (sample_normals
+                           ? sample_geometry_3dgs_bwd_kernel<true, true, scalar_t>
+                           : sample_geometry_3dgs_bwd_kernel<false, true, scalar_t>)
+                    : (sample_normals
+                           ? sample_geometry_3dgs_bwd_kernel<true, false, scalar_t>
+                           : sample_geometry_3dgs_bwd_kernel<false, false, scalar_t>);
             fn<<<blocks, threads, 0, stream>>>(
                 P,
                 N,
@@ -324,6 +397,7 @@ void launch_sample_geometry_3dgs_bwd_kernel(
                 tile_offsets.data_ptr<int32_t>(),
                 flatten_ids.data_ptr<int32_t>(),
                 n_isects,
+                out_depth_ptr,
                 v_depth.data_ptr<scalar_t>(),
                 v_alpha.data_ptr<scalar_t>(),
                 v_normal_ptr,

@@ -1395,6 +1395,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             Ks,
             render_normals,
             render_depths,
+            render_medians,
             normal_length,
             median_ids,
         )
@@ -1403,6 +1404,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
         ctx.render_geometry = render_geometry
+        ctx.reduction = reduction
 
         # double to float
         render_alphas = render_alphas.float()
@@ -1435,6 +1437,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             Ks,
             render_normals,
             render_depths,
+            render_medians,
             normal_length,
             median_ids,
         ) = ctx.saved_tensors
@@ -1443,6 +1446,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
         render_geometry = ctx.render_geometry
+        reduction = ctx.reduction
 
         (
             v_means2d_abs,
@@ -1470,11 +1474,13 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_render_alphas.contiguous(),
             absgrad,
             render_geometry,
+            reduction,
             ray_planes,
             normals,
             Ks,
             render_normals,
             render_depths,
+            render_medians,
             normal_length,
             median_ids,
             v_render_normals.contiguous() if v_render_normals is not None else None,
@@ -2757,6 +2763,7 @@ def sample_geometry(
     isect_offsets: Tensor,  # [tile_height, tile_width]
     flatten_ids: Tensor,    # [n_isects]
     normals: Optional[Tensor] = None,  # [N, 3]; enables normal sampling when given
+    median: bool = False,   # sample the opacity-volume median depth instead of the mean
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Sample the surface depth (and optionally camera-space normal) at arbitrary
     query pixels, reusing a precomputed per-tile Gaussian intersection. Differentiable
@@ -2780,6 +2787,7 @@ def sample_geometry(
         tile_size,
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
+        median,
     )
 
 
@@ -2801,6 +2809,7 @@ class _SampleGeometry(torch.autograd.Function):
         tile_size: int,
         isect_offsets: Tensor,
         flatten_ids: Tensor,
+        median: bool,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         sample_normals = normals is not None
         depth, alpha, normal = _make_lazy_cuda_func("sample_geometry_3dgs_fwd")(
@@ -2817,24 +2826,27 @@ class _SampleGeometry(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             sample_normals,
+            median,
         )
         ctx.save_for_backward(
             points2d, means2d, conics, opacities, ray_planes, normals, Ks,
-            isect_offsets, flatten_ids,
+            isect_offsets, flatten_ids, depth,
         )
         ctx.width = width
         ctx.height = height
         ctx.tile_size = tile_size
         ctx.sample_normals = sample_normals
+        ctx.median = median
         return depth, alpha, normal
 
     @staticmethod
     def backward(ctx, v_depth: Tensor, v_alpha: Tensor, v_normal: Tensor):
         (
             points2d, means2d, conics, opacities, ray_planes, normals, Ks,
-            isect_offsets, flatten_ids,
+            isect_offsets, flatten_ids, out_depth,
         ) = ctx.saved_tensors
         sample_normals = ctx.sample_normals
+        median = ctx.median
         v_depth = v_depth.contiguous()
         v_alpha = v_alpha.contiguous()
         v_normal = v_normal.contiguous() if sample_normals else None
@@ -2855,6 +2867,8 @@ class _SampleGeometry(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             sample_normals,
+            median,
+            out_depth if median else None,
             v_depth,
             v_alpha,
             v_normal,
@@ -2873,4 +2887,5 @@ class _SampleGeometry(torch.autograd.Function):
             None,                                      # tile_size
             None,                                      # isect_offsets
             None,                                      # flatten_ids
+            None,                                      # median
         )

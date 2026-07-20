@@ -25,6 +25,7 @@ def sample_geometry(
     eps2d: float = 0.3,
     tile_size: int = 16,
     sample_normals: bool = False,
+    reduction: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Sample the primary surface depth (and optionally camera-space normal)
     at arbitrary query pixels in a single camera.
@@ -120,4 +121,5 @@ def sample_geometry(
         isect_offsets[0],
         flatten_ids,
         normals=normals[0] if sample_normals else None,
+        median=(reduction == 1),
     )

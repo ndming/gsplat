@@ -93,13 +93,15 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     at::Tensor v_conics,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_opacities,                 // [..., N] or [nnz]
-    // geometry rendering (RD/PD/MD/WD); ignored unless render_geometry
+    // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
+    const uint32_t reduction,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals_in,
     const at::optional<at::Tensor> Ks,
     const at::optional<at::Tensor> render_normals,
     const at::optional<at::Tensor> render_depths,
+    const at::optional<at::Tensor> render_medians,
     const at::optional<at::Tensor> normal_length,
     const at::optional<at::Tensor> median_ids,
     const at::optional<at::Tensor> v_render_normals,

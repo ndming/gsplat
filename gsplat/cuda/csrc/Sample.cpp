@@ -42,7 +42,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sample_geometry_3dgs_fwd(
     const uint32_t tile_size,
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
-    const bool sample_normals
+    const bool sample_normals,
+    const bool median
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(points2d);
@@ -79,6 +80,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sample_geometry_3dgs_fwd(
         tile_offsets,
         flatten_ids,
         sample_normals,
+        median,
         out_depth,
         out_alpha,
         out_normal
@@ -102,6 +104,8 @@ sample_geometry_3dgs_bwd(
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     const bool sample_normals,
+    const bool median,
+    const at::optional<at::Tensor> out_depth, // forward depth (median z, for MEDIAN bwd)
     const at::Tensor v_depth,      // [P]
     const at::Tensor v_alpha,      // [P]
     const at::optional<at::Tensor> v_normal // [P, 3]
@@ -123,6 +127,10 @@ sample_geometry_3dgs_bwd(
         CHECK_INPUT(normals.value());
         CHECK_INPUT(v_normal.value());
     }
+    if (median) {
+        TORCH_CHECK(out_depth.has_value(), "median backward requires out_depth");
+        CHECK_INPUT(out_depth.value());
+    }
 
     const uint32_t N = means2d.size(0);
     const uint32_t P = points2d.size(0);
@@ -139,7 +147,7 @@ sample_geometry_3dgs_bwd(
     launch_sample_geometry_3dgs_bwd_kernel(
         points2d, means2d, conics, opacities, ray_planes, normals, Ks,
         image_width, image_height, tile_size, tile_offsets, flatten_ids,
-        sample_normals, v_depth, v_alpha, v_normal,
+        sample_normals, median, out_depth, v_depth, v_alpha, v_normal,
         v_means2d, v_conics, v_opacities, v_ray_planes, v_normals, v_points2d
     );
 

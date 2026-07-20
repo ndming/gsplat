@@ -29,7 +29,11 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
-template <uint32_t CDIM, bool GEOMETRY, typename scalar_t>
+// MEDIAN selects the median-depth gradient: false routes v_render_medians to the
+// T>0.5 crossing splat (matches the crossing reduction); true is the
+// opacity-volume level-set gradient (implicit-function-theorem via rsigma).
+// MEDIAN implies GEOMETRY.
+template <uint32_t CDIM, bool GEOMETRY, bool MEDIAN, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t I,
     const uint32_t N,
@@ -60,6 +64,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     // geometry fwd outputs (read only when GEOMETRY)
     const scalar_t *__restrict__ render_normals,  // [..., H, W, 3] normalized
     const scalar_t *__restrict__ render_depths,   // [..., H, W, 1] expected z
+    const scalar_t *__restrict__ render_medians,  // [..., H, W, 1] median z (MEDIAN)
     const scalar_t *__restrict__ normal_length,   // [..., H, W, 1]
     const int32_t *__restrict__ median_ids,       // [..., H, W]
     // grad outputs
@@ -101,6 +106,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     if constexpr (GEOMETRY) {
         render_normals += image_id * image_height * image_width * 3;
         render_depths += image_id * image_height * image_width;
+        if constexpr (MEDIAN) {
+            render_medians += image_id * image_height * image_width;
+        }
         normal_length += image_id * image_height * image_width;
         median_ids += image_id * image_height * image_width;
         v_render_normals += image_id * image_height * image_width * 3;
@@ -221,6 +229,79 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     const int32_t warp_bin_final =
         cg::reduce(warp, bin_final, cg::greater<int>());
+
+    // Opacity-volume median: implicit-function-theorem setup. Before the main
+    // back-to-front pass, compute per-pixel dT/dts at the median depth so the
+    // per-Gaussian pass can scale its gradients. Block-cooperative (front-to-back
+    // shared reloads); mDepth is the forward median in ray-distance.
+    float mDepth = 0.f;
+    float dL_dmt_dT_dtm = 0.f;
+    if constexpr (MEDIAN) {
+        const float inv_rln = rln > 1e-8f ? 1.f / rln : 0.f;
+        mDepth = (inside && render_medians[pix_id] > 0.f)
+                     ? render_medians[pix_id] * inv_rln
+                     : 0.f;
+        // 1-based count (within range) of this pixel's last contributor
+        const int lc =
+            (inside && bin_final >= range_start) ? (bin_final - range_start + 1) : 0;
+        __shared__ uint32_t s_bwd_max;
+        if (tr == 0) {
+            s_bwd_max = 0u;
+        }
+        block.sync();
+        atomicMax(&s_bwd_max, (uint32_t)max(lc, 0));
+        block.sync();
+        const uint32_t max_contributor = s_bwd_max;
+        const uint32_t oav_rounds =
+            (max_contributor + block_size - 1) / block_size;
+
+        float dT_dtm = 0.f;
+        bool done = (mDepth == 0.f) || (lc == 0) || !inside;
+        uint32_t contributor = 0;
+        int toDo = (int)max_contributor;
+        for (uint32_t r = 0; r < oav_rounds; ++r, toDo -= block_size) {
+            block.sync();
+            const uint32_t progress = r * block_size + tr;
+            if (progress < max_contributor) {
+                int32_t g = flatten_ids[range_start + progress];
+                const vec2 xy = means2d[g];
+                xy_opacity_batch[tr] = {xy.x, xy.y, opacities[g]};
+                conic_batch[tr] = conics[g];
+                ray_plane_batch[tr] = {
+                    ray_planes[g * 4], ray_planes[g * 4 + 1],
+                    ray_planes[g * 4 + 2], ray_planes[g * 4 + 3]
+                };
+            }
+            block.sync();
+            const int bsz = min((int)block_size, toDo);
+            for (int t = 0; !done && t < bsz; ++t) {
+                contributor++;
+                done = contributor >= (uint32_t)lc;
+                const vec3 xy_opac = xy_opacity_batch[t];
+                const vec2 d = {xy_opac.x - px, xy_opac.y - py};
+                const vec3 conic = conic_batch[t];
+                const float sigma = 0.5f * (conic.x * d.x * d.x +
+                                            conic.z * d.y * d.y) +
+                                    conic.y * d.x * d.y;
+                if (sigma < 0.f) {
+                    continue;
+                }
+                const float alpha = min(0.999f, xy_opac.z * __expf(-sigma));
+                if (alpha < ALPHA_THRESHOLD) {
+                    continue;
+                }
+                const vec4 rp = ray_plane_batch[t];
+                const float t_peak = rp.x * d.x + rp.y * d.y + rp.z;
+                const float rsigma = rp.w;
+                const float t_delta = (mDepth - t_peak) * rsigma;
+                const float G_exp = __expf(-0.5f * t_delta * t_delta);
+                const float Gt = alpha * G_exp;
+                dT_dtm += -0.25f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+            }
+        }
+        dL_dmt_dT_dtm = dL_dpixel_mt / fmaxf(-dT_dtm, 1e-7f);
+    }
+
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before writing next batch of shared mem
         block.sync();
@@ -297,6 +378,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             vec2 v_xy_abs_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
             vec3 v_ray_plane_local = {0.f, 0.f, 0.f}; // GEOMETRY {gx,gy,tc}
+            float v_rsigma_local = 0.f;               // MEDIAN: ray_plane.w grad
             vec3 v_normal_local = {0.f, 0.f, 0.f};    // GEOMETRY
             // initialize everything to 0, only set if the lane is valid
             if (valid) {
@@ -334,8 +416,29 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     const float tt = rp.x * delta.x + rp.y * delta.y + rp.z;
                     v_alpha += (tt * T - buffer_t * ra) * dL_dpixel_t;
                     dL_dt = fac * dL_dpixel_t;
-                    if ((batch_end - (int32_t)t) == median_ids[pix_id]) {
-                        dL_dt += dL_dpixel_mt;
+                    if constexpr (MEDIAN) {
+                        // Opacity-volume median: implicit-function-theorem grad at
+                        // the fixed per-pixel median depth (tt == t_peak).
+                        const float rsigma = rp.w;
+                        const float t_delta = (mDepth - tt) * rsigma;
+                        const float G_exp = __expf(-0.5f * t_delta * t_delta);
+                        const float Gt = alpha * G_exp;
+                        float dL_dGt = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
+                        dL_dGt = (mDepth > tt) ? dL_dGt : -dL_dGt;
+                        dL_dGt = (rsigma > 0.f) ? dL_dGt : 0.f;
+                        const float dL_dopa_sigma =
+                            dL_dGt * G_exp -
+                            dL_dmt_dT_dtm *
+                                (t_delta > 0.f ? 0.5f / (1.f - alpha) : 0.f);
+                        const float dL_ddelta = -dL_dGt * Gt * t_delta;
+                        v_rsigma_local = dL_ddelta * (mDepth - tt);
+                        dL_dt += -dL_ddelta * rsigma; // dL/dt_peak
+                        v_alpha += dL_dopa_sigma;
+                    } else {
+                        // Crossing median: route the median grad to the T>0.5 splat.
+                        if ((batch_end - (int32_t)t) == median_ids[pix_id]) {
+                            dL_dt += dL_dpixel_mt;
+                        }
                     }
                     v_ray_plane_local = {dL_dt * delta.x, dL_dt * delta.y, dL_dt};
                     rp_x = rp.x;
@@ -398,6 +501,9 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             if constexpr (GEOMETRY) {
                 warpSum(v_ray_plane_local, warp);
                 warpSum(v_normal_local, warp);
+                if constexpr (MEDIAN) {
+                    warpSum(v_rsigma_local, warp);
+                }
             }
             if (warp.thread_rank() == 0) {
                 int32_t g = id_batch[t]; // flatten index in [I * N] or [nnz]
@@ -429,7 +535,10 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     gpuAtomicAdd(v_ray_ptr, v_ray_plane_local.x);
                     gpuAtomicAdd(v_ray_ptr + 1, v_ray_plane_local.y);
                     gpuAtomicAdd(v_ray_ptr + 2, v_ray_plane_local.z);
-                    // v_ray_planes[.w] (rsigma) has no gradient path in the mean reduction
+                    if constexpr (MEDIAN) {
+                        // rsigma (ray_plane.w) gradient from the opacity-volume median
+                        gpuAtomicAdd(v_ray_ptr + 3, v_rsigma_local);
+                    }
                     float *v_nrm_ptr = (float *)(v_normals) + 3 * g;
                     gpuAtomicAdd(v_nrm_ptr, v_normal_local.x);
                     gpuAtomicAdd(v_nrm_ptr + 1, v_normal_local.y);
@@ -470,11 +579,13 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     at::Tensor v_opacities,                 // [..., N] or [nnz]
     // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
+    const uint32_t reduction,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals_in,
     const at::optional<at::Tensor> Ks,
     const at::optional<at::Tensor> render_normals,
     const at::optional<at::Tensor> render_depths,
+    const at::optional<at::Tensor> render_medians,
     const at::optional<at::Tensor> normal_length,
     const at::optional<at::Tensor> median_ids,
     const at::optional<at::Tensor> v_render_normals,
@@ -518,6 +629,10 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         render_geometry ? render_normals.value().data_ptr<float>() : nullptr;
     const float *render_depths_ptr =
         render_geometry ? render_depths.value().data_ptr<float>() : nullptr;
+    const float *render_medians_ptr =
+        (render_geometry && render_medians.has_value())
+            ? render_medians.value().data_ptr<float>()
+            : nullptr;
     const float *normal_length_ptr =
         render_geometry ? normal_length.value().data_ptr<float>() : nullptr;
     const int32_t *median_ids_ptr =
@@ -538,10 +653,10 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
     // writes. This requires moving the channel padding from python to C side.
-#define __RD_BWD_LAUNCH__(GEOM)                                                \
+#define __RD_BWD_LAUNCH__(GEOM, MED)                                           \
     do {                                                                       \
         if (cudaFuncSetAttribute(                                             \
-                rasterize_to_pixels_3dgs_bwd_kernel<CDIM, GEOM, float>,        \
+                rasterize_to_pixels_3dgs_bwd_kernel<CDIM, GEOM, MED, float>,   \
                 cudaFuncAttributeMaxDynamicSharedMemorySize,                   \
                 shmem_size) != cudaSuccess) {                                  \
             AT_ERROR(                                                          \
@@ -550,7 +665,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
                 " bytes), try lowering tile_size."                             \
             );                                                                 \
         }                                                                      \
-        rasterize_to_pixels_3dgs_bwd_kernel<CDIM, GEOM, float>                 \
+        rasterize_to_pixels_3dgs_bwd_kernel<CDIM, GEOM, MED, float>            \
             <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>( \
                 I, N, n_isects, packed,                                        \
                 reinterpret_cast<vec2 *>(means2d.data_ptr<float>()),           \
@@ -566,8 +681,8 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
                 ray_planes_ptr, normals_ptr, Ks_ptr,                           \
                 render_alphas.data_ptr<float>(),                               \
                 last_ids.data_ptr<int32_t>(),                                  \
-                render_normals_ptr, render_depths_ptr, normal_length_ptr,      \
-                median_ids_ptr,                                                \
+                render_normals_ptr, render_depths_ptr, render_medians_ptr,     \
+                normal_length_ptr, median_ids_ptr,                             \
                 v_render_colors.data_ptr<float>(),                             \
                 v_render_alphas.data_ptr<float>(),                             \
                 v_render_normals_ptr, v_render_depths_ptr,                     \
@@ -585,7 +700,11 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
 
     if (render_geometry) {
         if constexpr (CDIM == 3) {
-            __RD_BWD_LAUNCH__(true);
+            if (reduction == 1) {
+                __RD_BWD_LAUNCH__(true, true);
+            } else {
+                __RD_BWD_LAUNCH__(true, false);
+            }
         } else {
             AT_ERROR(
                 "render_geometry requires 3 color channels, got ",
@@ -593,7 +712,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             );
         }
     } else {
-        __RD_BWD_LAUNCH__(false);
+        __RD_BWD_LAUNCH__(false, false);
     }
 #undef __RD_BWD_LAUNCH__
 }
@@ -624,11 +743,13 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         at::Tensor v_colors,                                                   \
         at::Tensor v_opacities,                                                \
         const bool render_geometry,                                            \
+        const uint32_t reduction,                                              \
         const at::optional<at::Tensor> ray_planes,                             \
         const at::optional<at::Tensor> normals_in,                             \
         const at::optional<at::Tensor> Ks,                                     \
         const at::optional<at::Tensor> render_normals,                         \
         const at::optional<at::Tensor> render_depths,                          \
+        const at::optional<at::Tensor> render_medians,                         \
         const at::optional<at::Tensor> normal_length,                          \
         const at::optional<at::Tensor> median_ids,                             \
         const at::optional<at::Tensor> v_render_normals,                       \

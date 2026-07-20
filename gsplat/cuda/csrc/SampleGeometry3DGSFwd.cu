@@ -42,7 +42,10 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
-template <bool SAMPLE_NORMALS, typename scalar_t>
+// MEDIAN selects the sampled depth: false = alpha-weighted mean (expected);
+// true = opacity-volume level-set median (per-point binary search over the query
+// pixel's tile Gaussians, using the per-Gaussian ray spread rsigma).
+template <bool SAMPLE_NORMALS, bool MEDIAN, typename scalar_t>
 __global__ void sample_geometry_3dgs_fwd_kernel(
     const uint32_t P,               // number of query points
     const uint32_t N,               // number of Gaussians
@@ -99,6 +102,8 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
     float T = 1.f;
     float depth_acc = 0.f;
     vec3 normal_acc = {0.f, 0.f, 0.f};
+    float mseed = 0.f;      // MEDIAN: ray-distance of the T>0.5 crossing splat
+    int32_t k_stop = end;   // MEDIAN: exclusive bound of contributing splats
 
     for (int32_t k = start; k < end; ++k) {
         const int32_t g = flatten_ids[k];
@@ -114,11 +119,18 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
         }
         const float next_T = T * (1.0f - alpha);
         if (next_T <= 1e-4f) { // exclusive early-out, matches the full render
+            k_stop = k;
             break;
         }
         const float vis = alpha * T;
         const vec4 rp = ray_planes[g];
-        depth_acc += (rp.x * delta.x + rp.y * delta.y + rp.z) * vis;
+        const float depth_t = rp.x * delta.x + rp.y * delta.y + rp.z;
+        depth_acc += depth_t * vis;
+        if constexpr (MEDIAN) {
+            if (T > 0.5f) {
+                mseed = depth_t;
+            }
+        }
         if constexpr (SAMPLE_NORMALS) {
             const vec3 nm = normals[g];
             normal_acc.x += nm.x * vis;
@@ -135,7 +147,76 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
     const float rln = rsqrtf(ndx * ndx + ndy * ndy + 1.f);
 
     out_alpha[p] = alpha_pix;
-    out_depth[p] = alpha_pix > 1e-7f ? depth_acc * rln / alpha_pix : 0.f;
+    if constexpr (MEDIAN) {
+        // Opacity-volume level-set median over this pixel's contributing splats
+        // (per-point binary search). Works in ray-distance; -> z-depth via rln.
+        constexpr int OAV_SPLIT = 8;
+        constexpr int OAV_ITERS = 5;
+        constexpr float OAV_RANGE = 0.4f;
+        constexpr float OAV_MIN_T = 0.45f;
+        float oav_median = 0.f;
+        if (alpha_pix >= (1.f - OAV_MIN_T)) { // T <= OAV_MIN_T: opaque enough
+            float depth_min = fmaxf(mseed - OAV_RANGE, 0.f);
+            float depth_max = fmaxf(mseed + OAV_RANGE, 0.f);
+            bool in_range = true;
+            float T_p[OAV_SPLIT + 1];
+            for (int it = 0; it < OAV_ITERS; ++it) {
+                const bool first = (it == 0);
+                const int s_lo = first ? 0 : 1;
+                const int s_hi = first ? OAV_SPLIT + 1 : OAV_SPLIT;
+                for (int s = s_lo; s < s_hi; ++s) {
+                    T_p[s] = 1.f;
+                }
+                const float interval = (depth_max - depth_min) / (float)OAV_SPLIT;
+                for (int32_t k = start; k < k_stop; ++k) {
+                    const int32_t g = flatten_ids[k];
+                    const vec2 xy = means2d[g];
+                    const vec2 delta = {xy.x - px, xy.y - py};
+                    const vec3 conic = conics[g];
+                    const float sigma = 0.5f * (conic.x * delta.x * delta.x +
+                                                conic.z * delta.y * delta.y) +
+                                        conic.y * delta.x * delta.y;
+                    if (sigma < 0.f) {
+                        continue;
+                    }
+                    const float alpha = min(0.999f, opacities[g] * __expf(-sigma));
+                    if (alpha < ALPHA_THRESHOLD) {
+                        continue;
+                    }
+                    const vec4 rp = ray_planes[g];
+                    const float t_peak = rp.x * delta.x + rp.y * delta.y + rp.z;
+                    const float rsigma = rp.w;
+                    const bool ball = rsigma > 0.f;
+                    for (int s = s_lo; s < s_hi; ++s) {
+                        const float ts = depth_min + interval * s;
+                        const float dl = (ts - t_peak) * rsigma;
+                        const float gg = ball ? __expf(-0.5f * dl * dl) : 0.f;
+                        const float omg = 1.f - alpha * gg;
+                        const float rvac = rsqrtf(omg);
+                        T_p[s] *= (ts > t_peak ? (1.f - alpha) : omg) * rvac;
+                    }
+                }
+                if (first) {
+                    in_range = (T_p[0] >= 0.5f) && (T_p[OAV_SPLIT] <= 0.5f);
+                }
+                int sid = 0;
+                for (int s = 1; s < OAV_SPLIT; ++s) {
+                    sid = (T_p[s] >= 0.5f) ? s : sid;
+                }
+                depth_max = depth_min + (sid + 1) * interval;
+                depth_min = depth_min + (sid + 0) * interval;
+                T_p[0] = T_p[sid];
+                T_p[OAV_SPLIT] = T_p[sid + 1];
+            }
+            const float w_max =
+                __saturatef((T_p[0] - 0.5f) / (T_p[0] - T_p[OAV_SPLIT]));
+            oav_median = in_range ? (w_max * depth_max + (1.f - w_max) * depth_min)
+                                  : 0.f;
+        }
+        out_depth[p] = oav_median * rln;
+    } else {
+        out_depth[p] = alpha_pix > 1e-7f ? depth_acc * rln / alpha_pix : 0.f;
+    }
     if constexpr (SAMPLE_NORMALS) {
         const float inv_nlen =
             1.0f / fmaxf(sqrtf(normal_acc.x * normal_acc.x +
@@ -162,6 +243,7 @@ void launch_sample_geometry_3dgs_fwd_kernel(
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     const bool sample_normals,
+    const bool median,
     // outputs
     at::Tensor out_depth,  // [P]
     at::Tensor out_alpha,  // [P]
@@ -188,9 +270,14 @@ void launch_sample_geometry_3dgs_fwd_kernel(
                     : nullptr;
             auto out_normal_ptr =
                 sample_normals ? out_normal.data_ptr<scalar_t>() : nullptr;
-            auto fn = sample_normals
-                          ? sample_geometry_3dgs_fwd_kernel<true, scalar_t>
-                          : sample_geometry_3dgs_fwd_kernel<false, scalar_t>;
+            auto fn =
+                median
+                    ? (sample_normals
+                           ? sample_geometry_3dgs_fwd_kernel<true, true, scalar_t>
+                           : sample_geometry_3dgs_fwd_kernel<false, true, scalar_t>)
+                    : (sample_normals
+                           ? sample_geometry_3dgs_fwd_kernel<true, false, scalar_t>
+                           : sample_geometry_3dgs_fwd_kernel<false, false, scalar_t>);
             fn<<<blocks, threads, 0, stream>>>(
                 P,
                 N,

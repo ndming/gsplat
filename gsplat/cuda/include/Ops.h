@@ -306,11 +306,13 @@ rasterize_to_pixels_3dgs_bwd(
     bool absgrad,
     // geometry outputs
     const bool render_geometry,
+    const uint32_t reduction,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals,
     const at::optional<at::Tensor> Ks,
     const at::optional<at::Tensor> render_normals,
     const at::optional<at::Tensor> render_depths,
+    const at::optional<at::Tensor> render_medians,
     const at::optional<at::Tensor> normal_length,
     const at::optional<at::Tensor> median_ids,
     const at::optional<at::Tensor> v_render_normals,
@@ -332,7 +334,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sample_geometry_3dgs_fwd(
     const uint32_t tile_size,
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
-    const bool sample_normals
+    const bool sample_normals,
+    const bool median
 );
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -350,6 +353,8 @@ sample_geometry_3dgs_bwd(
     const at::Tensor tile_offsets,
     const at::Tensor flatten_ids,
     const bool sample_normals,
+    const bool median,
+    const at::optional<at::Tensor> out_depth,
     const at::Tensor v_depth,
     const at::Tensor v_alpha,
     const at::optional<at::Tensor> v_normal

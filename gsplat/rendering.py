@@ -138,7 +138,7 @@ def rasterization(
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "ZD", "RGB+ZD", "RGB+RD"] = "RGB",
+    render_mode: Literal["RGB", "ZD", "RGB+ZD", "RGB+RD", "RGB+MD"] = "RGB",
     sparse_grad: bool = False,
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
@@ -380,6 +380,7 @@ def rasterization(
         "ZD",
         "RGB+ZD",
         "RGB+RD",
+        "RGB+MD",
     ], render_mode
 
     # Rendering geometry (depths and normals) impose a few restrictions 
@@ -816,10 +817,22 @@ def rasterization(
             normals=normals,
             Ks=Ks,
             render_geometry=True,
+            # Median flavor: opacity-volume level-set for the median-primary mode,
+            # else the T>0.5 crossing.
+            reduction=1 if render_mode == "RGB+MD" else 0,
         )
-        render_colors = torch.cat(
-            [render_colors, render_depths, render_medians, render_normals], dim=-1
-        )  # [..., C, H, W, 8]
+        # Channel layout is [RGB(0:3), primary depth(3), secondary depth(4),
+        # normal(5:8)]. The expected and median depths swap roles by mode:
+        # expected-primary keeps expected in ch3; median-primary puts the
+        # opacity-volume median in ch3 and expected (free) in ch4.
+        if render_mode == "RGB+MD":
+            render_colors = torch.cat(
+                [render_colors, render_medians, render_depths, render_normals], dim=-1
+            )  # [..., C, H, W, 8]
+        else:
+            render_colors = torch.cat(
+                [render_colors, render_depths, render_medians, render_normals], dim=-1
+            )  # [..., C, H, W, 8]
         return render_colors, render_alphas, meta
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
