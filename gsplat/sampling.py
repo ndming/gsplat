@@ -112,6 +112,11 @@ def sample_geometry(
     _, isect_ids, flatten_ids = isect_tiles(means2d, radii, depths, tile_size, tile_w, tile_h)
     isect_offsets = isect_offset_encode(isect_ids, 1, tile_w, tile_h)  # [1, tile_h, tile_w]
 
+    # The PLANE (geometry_mode==2) depth is the ratio d_acc / -(n_acc . ray), so the
+    # accumulated normal is required to form the depth itself -- not only when the
+    # caller wants the normal output. Force it on so the sample kernel accumulates it.
+    need_normals = sample_normals or geometry_mode == 2
+
     return _sample_geometry_op(
         points2d,
         means2d[0],
@@ -124,7 +129,7 @@ def sample_geometry(
         tile_size,
         isect_offsets[0],
         flatten_ids,
-        normals=normals[0] if sample_normals else None,
+        normals=normals[0] if need_normals else None,
         geometry_mode=geometry_mode,
     )
 
