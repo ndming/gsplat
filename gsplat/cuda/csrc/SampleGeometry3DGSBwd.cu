@@ -52,6 +52,7 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
     const vec4 *__restrict__ ray_planes, // [N, 4]
     const vec3 *__restrict__ normals,    // [N, 3] read only when SAMPLE_NORMALS
     const scalar_t *__restrict__ Ks,     // [9]
+    const int geometry_mode,             // 0=RD, 1=MD, 2=PD
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
@@ -148,7 +149,21 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
     float grln = 0.f;           // grad on rln (-> query pixel)
     float mDepth = 0.f;         // MEDIAN: forward median in ray-distance
     float dL_dmt_dT_dtm = 0.f;  // MEDIAN: dL/d(median) / (-dT/d ts)
-    if constexpr (MEDIAN) {
+    // PGSR unbiased plane depth: out_depth = D / -(Nrm.ray + eps). alpha and rln
+    // cancel; the normal seed gets the denominator's Nrm dependence. Query-pixel
+    // (points2d) grad from the PD ray is not propagated (grln=0): the multi-view
+    // neighbour sample is used detached w.r.t. its query pixels.
+    bool pd_done = false;
+    if (geometry_mode == 2) {
+        const float tmp = Nrm.x * ndx + Nrm.y * ndy + Nrm.z + 1e-8f;
+        dL_dpixel_t = -gd / tmp;             // dL/d(depth_acc D)
+        v_depth_finalT = 0.f;
+        grln = 0.f;
+        pd_done = true;
+    }
+    if (pd_done) {
+        // skip the RD/MD depth-seed branch below
+    } else if constexpr (MEDIAN) {
         const float inv_rln = rln > 1e-8f ? 1.f / rln : 0.f;
         mDepth = out_depth[p] * inv_rln; // z -> ray-distance
         grln = gd * mDepth;              // out_depth = mDepth * rln
@@ -188,17 +203,27 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
     // normal normalization VJP (only when sampling normals)
     float dL_dpixel_normal[3] = {0.f, 0.f, 0.f};
     if constexpr (SAMPLE_NORMALS) {
-        const float nlen = sqrtf(Nrm.x * Nrm.x + Nrm.y * Nrm.y + Nrm.z * Nrm.z);
-        const float denom = fmaxf(nlen, 1e-6f);
-        const float large = nlen < 1e-6f ? 0.f : 1.f;
-        const vec3 nout = {Nrm.x / denom, Nrm.y / denom, Nrm.z / denom};
         const vec3 vn = {
             v_normal[p * 3 + 0], v_normal[p * 3 + 1], v_normal[p * 3 + 2]
         };
-        const float dp = (vn.x * nout.x + vn.y * nout.y + vn.z * nout.z) * large;
-        dL_dpixel_normal[0] = (vn.x - dp * nout.x) / denom;
-        dL_dpixel_normal[1] = (vn.y - dp * nout.y) / denom;
-        dL_dpixel_normal[2] = (vn.z - dp * nout.z) / denom;
+        if (geometry_mode == 2) {
+            // PD: rendered normal is RAW (Nrm), so vn maps directly; plus the
+            // plane-depth denominator's dependence on Nrm.
+            const float tmp = Nrm.x * ndx + Nrm.y * ndy + Nrm.z + 1e-8f;
+            const float coef = gd * D / (tmp * tmp); // gd*depth_acc/tmp^2
+            dL_dpixel_normal[0] = vn.x + coef * ndx;
+            dL_dpixel_normal[1] = vn.y + coef * ndy;
+            dL_dpixel_normal[2] = vn.z + coef;
+        } else {
+            const float nlen = sqrtf(Nrm.x * Nrm.x + Nrm.y * Nrm.y + Nrm.z * Nrm.z);
+            const float denom = fmaxf(nlen, 1e-6f);
+            const float large = nlen < 1e-6f ? 0.f : 1.f;
+            const vec3 nout = {Nrm.x / denom, Nrm.y / denom, Nrm.z / denom};
+            const float dp = (vn.x * nout.x + vn.y * nout.y + vn.z * nout.z) * large;
+            dL_dpixel_normal[0] = (vn.x - dp * nout.x) / denom;
+            dL_dpixel_normal[1] = (vn.y - dp * nout.y) / denom;
+            dL_dpixel_normal[2] = (vn.z - dp * nout.z) / denom;
+        }
     }
 
     // ---- PASS 2: gradients (back-to-front, suffix buffers) ----
@@ -332,7 +357,7 @@ void launch_sample_geometry_3dgs_bwd_kernel(
     const at::Tensor tile_offsets,
     const at::Tensor flatten_ids,
     const bool sample_normals,
-    const bool median,
+    const int geometry_mode,
     const at::optional<at::Tensor> out_depth,
     const at::Tensor v_depth,
     const at::Tensor v_alpha,
@@ -344,6 +369,7 @@ void launch_sample_geometry_3dgs_bwd_kernel(
     at::optional<at::Tensor> v_normals,
     at::Tensor v_points2d
 ) {
+    const bool median = (geometry_mode == 1);
     const uint32_t P = points2d.size(0);
     const uint32_t N = means2d.size(0);
     const uint32_t tile_height = tile_offsets.size(-2);
@@ -389,6 +415,7 @@ void launch_sample_geometry_3dgs_bwd_kernel(
                 reinterpret_cast<vec4 *>(ray_planes.data_ptr<scalar_t>()),
                 normals_ptr,
                 Ks.data_ptr<scalar_t>(),
+                geometry_mode,
                 image_width,
                 image_height,
                 tile_size,

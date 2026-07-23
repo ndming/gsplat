@@ -59,6 +59,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const scalar_t *__restrict__ ray_planes, // [I, N, 4] or [nnz, 4]
     const scalar_t *__restrict__ normals,    // [I, N, 3] or [nnz, 3]
     const scalar_t *__restrict__ Ks,         // [I, 3, 3]
+    const int geometry_mode,                 // 0=RD, 1=MD, 2=PD
     scalar_t
         *__restrict__ render_colors, // [I, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [I, image_height, image_width, 1]
@@ -68,7 +69,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     scalar_t *__restrict__ render_depths,  // [I, H, W, 1] expected z-depth
     scalar_t *__restrict__ render_medians, // [I, H, W, 1] median z-depth
     scalar_t *__restrict__ normal_length,  // [I, H, W, 1]
-    int32_t *__restrict__ median_ids       // [I, H, W]
+    int32_t *__restrict__ median_ids,      // [I, H, W]
+    int32_t *__restrict__ out_observe      // [N] per-Gaussian T>0.5 contribution count (optional)
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -233,6 +235,12 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
                 continue;
             }
 
+            // PGSR observe-trim counter: this Gaussian contributes to this pixel
+            // while transmittance is still > 0.5 (i.e. near the visible surface).
+            if (out_observe != nullptr && T > 0.5f) {
+                atomicAdd(&out_observe[id_batch[t]], 1);
+            }
+
             const float next_T = T * (1.0f - alpha);
             if (next_T <= 1e-4f) { // this pixel is done: exclusive
                 done = true;
@@ -391,28 +399,47 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         last_ids[pix_id] = static_cast<int32_t>(cur_idx);
 
         if constexpr (GEOMETRY) {
-            const float alpha_pix = 1.0f - T;
-            // Expected z-depth: alpha-weighted mean plane depth, then
-            // ray-distance -> z via rln.
-            render_depths[pix_id] =
-                alpha_pix > 1e-6f ? (depth_acc * rln) / alpha_pix : 0.f;
-            // Median z-depth: opacity-volume level-set when MEDIAN, else the
-            // depth of the T>0.5 crossing splat.
-            if constexpr (MEDIAN) {
-                render_medians[pix_id] = oav_median * rln;
-            } else {
-                render_medians[pix_id] = median_depth * rln;
-            }
             const float nlen = sqrtf(
                 normal_acc[0] * normal_acc[0] + normal_acc[1] * normal_acc[1] +
                 normal_acc[2] * normal_acc[2]
             );
             normal_length[pix_id] = nlen;
-            const float inv_nlen = 1.0f / fmaxf(nlen, 1e-6f);
-            render_normals[pix_id * 3 + 0] = normal_acc[0] * inv_nlen;
-            render_normals[pix_id * 3 + 1] = normal_acc[1] * inv_nlen;
-            render_normals[pix_id * 3 + 2] = normal_acc[2] * inv_nlen;
-            median_ids[pix_id] = median_idx;
+            if (geometry_mode == 2) {
+                // PGSR unbiased plane depth. depth_acc = sum(vis * dist) (ray_plane
+                // is (0,0,dist,0)); normal_acc = sum(vis * n_cam). The alpha weight
+                // cancels in the ratio, so no /alpha and no rln:
+                //   plane_depth = dist_acc / -(n_acc . (ndx, ndy, 1) + eps)
+                // ndx/ndy already built above from real cx,cy. Normal is emitted
+                // RAW (unnormalized), matching PGSR out_all_map[0:3].
+                const float ndx = (px - Ks[2]) / Ks[0];
+                const float ndy = (py - Ks[5]) / Ks[4];
+                const float tmp =
+                    normal_acc[0] * ndx + normal_acc[1] * ndy + normal_acc[2] + 1e-8f;
+                render_depths[pix_id] = depth_acc / -tmp;
+                render_medians[pix_id] = 0.f;
+                render_normals[pix_id * 3 + 0] = normal_acc[0];
+                render_normals[pix_id * 3 + 1] = normal_acc[1];
+                render_normals[pix_id * 3 + 2] = normal_acc[2];
+                median_ids[pix_id] = 0;
+            } else {
+                const float alpha_pix = 1.0f - T;
+                // Expected z-depth: alpha-weighted mean plane depth, then
+                // ray-distance -> z via rln.
+                render_depths[pix_id] =
+                    alpha_pix > 1e-6f ? (depth_acc * rln) / alpha_pix : 0.f;
+                // Median z-depth: opacity-volume level-set when MEDIAN, else the
+                // depth of the T>0.5 crossing splat.
+                if constexpr (MEDIAN) {
+                    render_medians[pix_id] = oav_median * rln;
+                } else {
+                    render_medians[pix_id] = median_depth * rln;
+                }
+                const float inv_nlen = 1.0f / fmaxf(nlen, 1e-6f);
+                render_normals[pix_id * 3 + 0] = normal_acc[0] * inv_nlen;
+                render_normals[pix_id * 3 + 1] = normal_acc[1] * inv_nlen;
+                render_normals[pix_id * 3 + 2] = normal_acc[2] * inv_nlen;
+                median_ids[pix_id] = median_idx;
+            }
         }
     }
 }
@@ -439,7 +466,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::Tensor last_ids, // [..., image_height, image_width]
     // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
-    const uint32_t reduction,                      // median flavor: 0=crossing, 1=opacity-volume
+    const int geometry_mode,                       // 0=RD, 1=MD (opacity-volume), 2=PD (plane)
     const at::optional<at::Tensor> ray_planes,     // [..., N, 4]
     const at::optional<at::Tensor> normals_in,     // [..., N, 3]
     const at::optional<at::Tensor> Ks,             // [..., 3, 3]
@@ -447,7 +474,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::optional<at::Tensor> render_depths,        // [..., H, W, 1]
     at::optional<at::Tensor> render_medians,       // [..., H, W, 1]
     at::optional<at::Tensor> normal_length,        // [..., H, W, 1]
-    at::optional<at::Tensor> median_ids            // [..., H, W]
+    at::optional<at::Tensor> median_ids,           // [..., H, W]
+    at::optional<at::Tensor> out_observe           // [N] optional observe-trim counter
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -485,6 +513,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         render_geometry ? normal_length.value().data_ptr<float>() : nullptr;
     int32_t *median_ids_ptr =
         render_geometry ? median_ids.value().data_ptr<int32_t>() : nullptr;
+    int32_t *out_observe_ptr =
+        out_observe.has_value() ? out_observe.value().data_ptr<int32_t>() : nullptr;
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
@@ -525,6 +555,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
                 ray_planes_ptr,                                                \
                 normals_ptr,                                                   \
                 Ks_ptr,                                                        \
+                geometry_mode,                                                 \
                 renders.data_ptr<float>(),                                     \
                 alphas.data_ptr<float>(),                                      \
                 last_ids.data_ptr<int32_t>(),                                  \
@@ -532,16 +563,19 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
                 render_depths_ptr,                                             \
                 render_medians_ptr,                                            \
                 normal_length_ptr,                                             \
-                median_ids_ptr                                                 \
+                median_ids_ptr,                                                \
+                out_observe_ptr                                                \
             );                                                                 \
     } while (0)
 
     if (render_geometry) {
         // Geometry rendering is only compiled/allowed for RGB (3 channels).
         if constexpr (CDIM == 3) {
-            if (reduction == 1) {
+            if (geometry_mode == 1) {
                 __RD_LAUNCH__(true, true);
             } else {
+                // RD (0) and PD (2) both use MEDIAN=false; PD switches the depth
+                // finalization at runtime via geometry_mode inside the kernel.
                 __RD_LAUNCH__(true, false);
             }
         } else {
@@ -576,7 +610,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         at::Tensor alphas,                                                     \
         at::Tensor last_ids,                                                   \
         const bool render_geometry,                                            \
-        const uint32_t reduction,                                              \
+        const int geometry_mode,                                               \
         const at::optional<at::Tensor> ray_planes,                             \
         const at::optional<at::Tensor> normals_in,                             \
         const at::optional<at::Tensor> Ks,                                     \
@@ -584,7 +618,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         at::optional<at::Tensor> render_depths,                                \
         at::optional<at::Tensor> render_medians,                               \
         at::optional<at::Tensor> normal_length,                                \
-        at::optional<at::Tensor> median_ids                                    \
+        at::optional<at::Tensor> median_ids,                                   \
+        at::optional<at::Tensor> out_observe                                   \
     );
 
 __INS__(1)

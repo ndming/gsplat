@@ -57,6 +57,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const scalar_t *__restrict__ ray_planes, // [..., N, 4] or [nnz, 4]
     const scalar_t *__restrict__ normals_in, // [..., N, 3] or [nnz, 3]
     const scalar_t *__restrict__ Ks,         // [..., 3, 3]
+    const int geometry_mode,                 // 0=RD, 1=MD, 2=PD
     // fwd outputs
     const scalar_t
         *__restrict__ render_alphas,      // [..., image_height, image_width, 1]
@@ -195,32 +196,56 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     float v_depth_finalT = 0.f;    // depth's contribution routed through T_final
     float dL_dpixel_normal[3] = {0.f, 0.f, 0.f};
     if constexpr (GEOMETRY) {
-        const float w_final = render_alphas[pix_id];
-        const float inv_w = w_final > 1e-6f ? 1.f / w_final : 0.f;
-        const float vd = v_render_depths[pix_id];
-        // out_depth = accum_depth / w_final = expected z-depth
-        dL_dpixel_t = vd * inv_w * rln;
-        v_depth_finalT = vd * render_depths[pix_id] * inv_w;
-        dL_dpixel_mt =
-            (v_render_medians != nullptr ? v_render_medians[pix_id] : 0.f) * rln;
-        // Jacobian of L2-normalization of the accumulated normal
-        const float nlen = normal_length[pix_id];
-        const float denom = fmaxf(nlen, 1e-6f);
-        const float large = nlen < 1e-6f ? 0.f : 1.f;
-        const vec3 nmap = {
-            render_normals[pix_id * 3 + 0],
-            render_normals[pix_id * 3 + 1],
-            render_normals[pix_id * 3 + 2]
-        };
         const vec3 vn = {
             v_render_normals[pix_id * 3 + 0],
             v_render_normals[pix_id * 3 + 1],
             v_render_normals[pix_id * 3 + 2]
         };
-        const float dp = (vn.x * nmap.x + vn.y * nmap.y + vn.z * nmap.z) * large;
-        dL_dpixel_normal[0] = (vn.x - dp * nmap.x) / denom;
-        dL_dpixel_normal[1] = (vn.y - dp * nmap.y) / denom;
-        dL_dpixel_normal[2] = (vn.z - dp * nmap.z) / denom;
+        if (geometry_mode == 2) {
+            // PGSR unbiased plane depth. plane_depth = depth_acc / -(n_acc.ray + eps).
+            // The rendered normal is RAW (n_acc), so v_render_normals maps directly to
+            // dL/d(n_acc) with NO unit-normalize Jacobian; plane_depth adds a further
+            // n_acc dependence via the denominator, folded into the normal seed. No
+            // /alpha and no rln (both cancel), so v_depth_finalT stays 0.
+            const float fx = Ks[0], fy = Ks[4], cx = Ks[2], cy = Ks[5];
+            const float ndx = (px - cx) / fx;
+            const float ndy = (py - cy) / fy;
+            const vec3 nacc = {
+                render_normals[pix_id * 3 + 0],
+                render_normals[pix_id * 3 + 1],
+                render_normals[pix_id * 3 + 2]
+            };
+            const float tmp = nacc.x * ndx + nacc.y * ndy + nacc.z + 1e-8f;
+            const float vd = v_render_depths[pix_id];
+            const float depth_acc = -render_depths[pix_id] * tmp; // recover numerator
+            dL_dpixel_t = -vd / tmp;                              // dL/d(depth_acc)
+            const float coef = vd * depth_acc / (tmp * tmp);      // dL/d(n_acc) via denom
+            dL_dpixel_normal[0] = vn.x + coef * ndx;
+            dL_dpixel_normal[1] = vn.y + coef * ndy;
+            dL_dpixel_normal[2] = vn.z + coef;
+        } else {
+            const float w_final = render_alphas[pix_id];
+            const float inv_w = w_final > 1e-6f ? 1.f / w_final : 0.f;
+            const float vd = v_render_depths[pix_id];
+            // out_depth = accum_depth / w_final = expected z-depth
+            dL_dpixel_t = vd * inv_w * rln;
+            v_depth_finalT = vd * render_depths[pix_id] * inv_w;
+            dL_dpixel_mt =
+                (v_render_medians != nullptr ? v_render_medians[pix_id] : 0.f) * rln;
+            // Jacobian of L2-normalization of the accumulated normal
+            const float nlen = normal_length[pix_id];
+            const float denom = fmaxf(nlen, 1e-6f);
+            const float large = nlen < 1e-6f ? 0.f : 1.f;
+            const vec3 nmap = {
+                render_normals[pix_id * 3 + 0],
+                render_normals[pix_id * 3 + 1],
+                render_normals[pix_id * 3 + 2]
+            };
+            const float dp = (vn.x * nmap.x + vn.y * nmap.y + vn.z * nmap.z) * large;
+            dL_dpixel_normal[0] = (vn.x - dp * nmap.x) / denom;
+            dL_dpixel_normal[1] = (vn.y - dp * nmap.y) / denom;
+            dL_dpixel_normal[2] = (vn.z - dp * nmap.z) / denom;
+        }
     }
 
     // collect and process batches of gaussians
@@ -579,7 +604,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     at::Tensor v_opacities,                 // [..., N] or [nnz]
     // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
-    const uint32_t reduction,
+    const int geometry_mode,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals_in,
     const at::optional<at::Tensor> Ks,
@@ -678,7 +703,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
                 image_width, image_height, tile_size, tile_width, tile_height, \
                 tile_offsets.data_ptr<int32_t>(),                              \
                 flatten_ids.data_ptr<int32_t>(),                               \
-                ray_planes_ptr, normals_ptr, Ks_ptr,                           \
+                ray_planes_ptr, normals_ptr, Ks_ptr, geometry_mode,            \
                 render_alphas.data_ptr<float>(),                               \
                 last_ids.data_ptr<int32_t>(),                                  \
                 render_normals_ptr, render_depths_ptr, render_medians_ptr,     \
@@ -700,7 +725,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
 
     if (render_geometry) {
         if constexpr (CDIM == 3) {
-            if (reduction == 1) {
+            if (geometry_mode == 1) {
                 __RD_BWD_LAUNCH__(true, true);
             } else {
                 __RD_BWD_LAUNCH__(true, false);
@@ -743,7 +768,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         at::Tensor v_colors,                                                   \
         at::Tensor v_opacities,                                                \
         const bool render_geometry,                                            \
-        const uint32_t reduction,                                              \
+        const int geometry_mode,                                               \
         const at::optional<at::Tensor> ray_planes,                             \
         const at::optional<at::Tensor> normals_in,                             \
         const at::optional<at::Tensor> Ks,                                     \

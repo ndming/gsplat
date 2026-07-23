@@ -138,7 +138,8 @@ def rasterization(
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "ZD", "RGB+ZD", "RGB+RD", "RGB+MD"] = "RGB",
+    render_mode: Literal["RGB", "ZD", "RGB+ZD", "RGB+RD", "RGB+MD", "RGB+PD"] = "RGB",
+    count_observe: bool = False,
     sparse_grad: bool = False,
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
@@ -277,6 +278,7 @@ def rasterization(
         render_mode: The rendering mode. Supported modes are "RGB", "D", "ED", "RGB+D",
             and "RGB+ED". "RGB" renders the colored image, "D" renders the accumulated depth, and
             "ED" renders the expected depth. Default is "RGB".
+        count_observe: Whether to return per-Gaussian T>0.5 counts in meta
         sparse_grad: If true, the gradients for {means, quats, scales} will be stored in
             a COO sparse layout. This can be helpful for saving memory. Default is False.
         absgrad: If true, the absolute gradients of the projected 2D means
@@ -381,10 +383,14 @@ def rasterization(
         "RGB+ZD",
         "RGB+RD",
         "RGB+MD",
+        "RGB+PD",
     ], render_mode
 
-    # Rendering geometry (depths and normals) impose a few restrictions 
-    render_geometry = render_mode in ["RGB+RD", "RGB+PD", "RGB+MD", "RGB+WD"] 
+    # Rendering geometry (depths and normals) impose a few restrictions
+    render_geometry = render_mode in ["RGB+RD", "RGB+PD", "RGB+MD", "RGB+WD"]
+    # Geometry mode selects the depth formulation: RD (RaDe ray-plane expected),
+    # MD (opacity-volume median), PD (PGSR unbiased plane depth).
+    geometry_mode = {"RGB+RD": 0, "RGB+MD": 1, "RGB+PD": 2}.get(render_mode, 0)
     if render_geometry:
         assert camera_model == "pinhole", "Geometry rendering requires the pinhole camera model"
         assert not packed, "Geometry rendering is not supported in packed mode"
@@ -530,6 +536,7 @@ def rasterization(
             camera_model=camera_model,
             opacities=opacities,  # use opacities to compute a tigher bound for radii.
             render_geometry=render_geometry,
+            geometry_mode=geometry_mode,
         )
 
     if packed:
@@ -800,6 +807,7 @@ def rasterization(
             render_normals,
             render_depths,
             render_medians,
+            out_observe,
         ) = rasterize_to_pixels(
             means2d,
             conics,
@@ -817,14 +825,13 @@ def rasterization(
             normals=normals,
             Ks=Ks,
             render_geometry=True,
-            # Median flavor: opacity-volume level-set for the median-primary mode,
-            # else the T>0.5 crossing.
-            reduction=1 if render_mode == "RGB+MD" else 0,
+            # 0=RD (expected), 1=MD (opacity-volume median), 2=PD (PGSR plane depth).
+            geometry_mode=geometry_mode,
+            count_observe=count_observe,
         )
-        # Channel layout is [RGB(0:3), primary depth(3), secondary depth(4),
-        # normal(5:8)]. The expected and median depths swap roles by mode:
-        # expected-primary keeps expected in ch3; median-primary puts the
-        # opacity-volume median in ch3 and expected (free) in ch4.
+        # Multi-view observe-trim per-Gaussian counter (0-size unless count_observe).
+        meta["out_observe"] = out_observe
+        # Channel layout is [RGB(0:3), primary depth(3), secondary depth(4), normal(5:8)].
         if render_mode == "RGB+MD":
             render_colors = torch.cat(
                 [render_colors, render_medians, render_depths, render_normals], dim=-1

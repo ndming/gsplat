@@ -142,7 +142,8 @@ projection_ewa_3dgs_fused_fwd(
     const float radius_clip,
     const bool calc_compensations,
     const CameraModelType camera_model,
-    const bool render_geometry
+    const bool render_geometry,
+    const int geometry_mode
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -221,6 +222,7 @@ projection_ewa_3dgs_fused_fwd(
         calc_compensations ? at::optional<at::Tensor>(compensations)
                            : c10::nullopt,
         render_geometry,
+        geometry_mode,
         render_geometry ? at::optional<at::Tensor>(ray_planes) : c10::nullopt,
         render_geometry ? at::optional<at::Tensor>(normals) : c10::nullopt
     );
@@ -251,6 +253,7 @@ projection_ewa_3dgs_fused_bwd(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
+    const int geometry_mode,                        // 0=RD, 1=MD, 2=PD
     const at::optional<at::Tensor> v_ray_planes,    // [..., C, N, 4] optional
     const at::optional<at::Tensor> v_normals,       // [..., C, N, 3] optional
     const bool viewmats_requires_grad
@@ -311,6 +314,7 @@ projection_ewa_3dgs_fused_bwd(
         v_depths,
         v_conics,
         v_compensations,
+        geometry_mode,
         v_ray_planes,
         v_normals,
         viewmats_requires_grad,

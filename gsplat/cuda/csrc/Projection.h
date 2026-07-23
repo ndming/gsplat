@@ -76,6 +76,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     at::Tensor conics,                      // [..., C, N, 3]
     at::optional<at::Tensor> compensations, // [..., C, N] optional
     const bool render_geometry,
+    const int geometry_mode,                // 0=RD, 1=MD, 2=PD
     at::optional<at::Tensor> ray_planes,    // [..., C, N, 4] optional
     at::optional<at::Tensor> normals        // [..., C, N, 3] optional
 );
@@ -101,6 +102,7 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
+    const int geometry_mode,                        // 0=RD, 1=MD, 2=PD
     const at::optional<at::Tensor> v_ray_planes,    // [..., C, N, 4] optional
     const at::optional<at::Tensor> v_normals,       // [..., C, N, 3] optional
     const bool viewmats_requires_grad,

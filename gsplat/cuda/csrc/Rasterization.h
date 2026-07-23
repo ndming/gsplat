@@ -54,7 +54,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::Tensor last_ids, // [..., image_height, image_width]
     // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
-    const uint32_t reduction,
+    const int geometry_mode,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals_in,
     const at::optional<at::Tensor> Ks,
@@ -62,7 +62,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::optional<at::Tensor> render_depths,
     at::optional<at::Tensor> render_medians,
     at::optional<at::Tensor> normal_length,
-    at::optional<at::Tensor> median_ids
+    at::optional<at::Tensor> median_ids,
+    at::optional<at::Tensor> out_observe
 );
 
 template <uint32_t CDIM>
@@ -95,7 +96,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     at::Tensor v_opacities,                 // [..., N] or [nnz]
     // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
-    const uint32_t reduction,
+    const int geometry_mode,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals_in,
     const at::optional<at::Tensor> Ks,

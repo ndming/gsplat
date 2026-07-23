@@ -42,6 +42,7 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
+    at::Tensor,
     at::Tensor>
 rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
@@ -60,10 +61,11 @@ rasterize_to_pixels_3dgs_fwd(
     const at::Tensor flatten_ids,  // [n_isects]
     // geometry outputs
     const bool render_geometry,
-    const uint32_t reduction,                  // median flavor: 0=crossing, 1=opacity-volume
+    const int geometry_mode,                  // median flavor: 0=crossing, 1=opacity-volume
     const at::optional<at::Tensor> ray_planes, // [..., N, 4]
     const at::optional<at::Tensor> normals,    // [..., N, 3]
-    const at::optional<at::Tensor> Ks          // [..., 3, 3]
+    const at::optional<at::Tensor> Ks,         // [..., 3, 3]
+    const bool count_observe                   // Multi-view observe-trim per-Gaussian counter
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -128,6 +130,11 @@ rasterize_to_pixels_3dgs_fwd(
         median_ids = at::empty(ids_dims, opt.dtype(at::kInt));
     }
 
+    // Observe-trim counter: zero-initialized [N] int, filled via atomicAdd.
+    at::Tensor out_observe = count_observe
+        ? at::zeros({means2d.size(-2)}, opt.dtype(at::kInt))
+        : at::empty({0}, opt.dtype(at::kInt));
+
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
         launch_rasterize_to_pixels_3dgs_fwd_kernel<N>(                         \
@@ -146,7 +153,7 @@ rasterize_to_pixels_3dgs_fwd(
             alphas,                                                            \
             last_ids,                                                          \
             render_geometry,                                                   \
-            reduction,                                                         \
+            geometry_mode,                                                         \
             ray_planes,                                                        \
             normals,                                                           \
             Ks,                                                                \
@@ -159,7 +166,9 @@ rasterize_to_pixels_3dgs_fwd(
             render_geometry ? at::optional<at::Tensor>(normal_length)          \
                             : c10::nullopt,                                    \
             render_geometry ? at::optional<at::Tensor>(median_ids)             \
-                            : c10::nullopt                                     \
+                            : c10::nullopt,                                    \
+            count_observe ? at::optional<at::Tensor>(out_observe)              \
+                          : c10::nullopt                                       \
         );                                                                     \
         break;
 
@@ -199,7 +208,8 @@ rasterize_to_pixels_3dgs_fwd(
         render_depths,
         render_medians,
         normal_length,
-        median_ids
+        median_ids,
+        out_observe
     );
 }
 
@@ -236,7 +246,7 @@ rasterize_to_pixels_3dgs_bwd(
     bool absgrad,
     // geometry outputs
     const bool render_geometry,
-    const uint32_t reduction,
+    const int geometry_mode,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals,
     const at::optional<at::Tensor> Ks,
@@ -317,7 +327,7 @@ rasterize_to_pixels_3dgs_bwd(
             v_colors,                                                          \
             v_opacities,                                                       \
             render_geometry,                                                   \
-            reduction,                                                         \
+            geometry_mode,                                                         \
             ray_planes,                                                        \
             normals,                                                           \
             Ks,                                                                \

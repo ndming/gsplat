@@ -56,6 +56,7 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
     const vec4 *__restrict__ ray_planes, // [N, 4] {gx, gy, tc, rsigma}
     const vec3 *__restrict__ normals,    // [N, 3] read only when SAMPLE_NORMALS
     const scalar_t *__restrict__ Ks,     // [9] pinhole intrinsics
+    const int geometry_mode,             // 0=RD, 1=MD, 2=PD
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
@@ -147,7 +148,12 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
     const float rln = rsqrtf(ndx * ndx + ndy * ndy + 1.f);
 
     out_alpha[p] = alpha_pix;
-    if constexpr (MEDIAN) {
+    if (geometry_mode == 2) {
+        // PGSR unbiased plane depth: depth_acc = sum(vis*dist), normal_acc =
+        // sum(vis*n); alpha cancels in the ratio, no rln. Mirrors the rasterizer.
+        const float tmp = normal_acc.x * ndx + normal_acc.y * ndy + normal_acc.z + 1e-8f;
+        out_depth[p] = depth_acc / -tmp;
+    } else if constexpr (MEDIAN) {
         // Opacity-volume level-set median over this pixel's contributing splats
         // (per-point binary search). Works in ray-distance; -> z-depth via rln.
         constexpr int OAV_SPLIT = 8;
@@ -218,11 +224,14 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
         out_depth[p] = alpha_pix > 1e-7f ? depth_acc * rln / alpha_pix : 0.f;
     }
     if constexpr (SAMPLE_NORMALS) {
+        // PD emits the RAW accumulated normal (PGSR-faithful); RD/MD normalize.
         const float inv_nlen =
-            1.0f / fmaxf(sqrtf(normal_acc.x * normal_acc.x +
-                               normal_acc.y * normal_acc.y +
-                               normal_acc.z * normal_acc.z),
-                         1e-6f);
+            geometry_mode == 2
+                ? 1.0f
+                : 1.0f / fmaxf(sqrtf(normal_acc.x * normal_acc.x +
+                                     normal_acc.y * normal_acc.y +
+                                     normal_acc.z * normal_acc.z),
+                               1e-6f);
         out_normal[p * 3 + 0] = normal_acc.x * inv_nlen;
         out_normal[p * 3 + 1] = normal_acc.y * inv_nlen;
         out_normal[p * 3 + 2] = normal_acc.z * inv_nlen;
@@ -243,12 +252,13 @@ void launch_sample_geometry_3dgs_fwd_kernel(
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     const bool sample_normals,
-    const bool median,
+    const int geometry_mode,   // 0=RD, 1=MD, 2=PD
     // outputs
     at::Tensor out_depth,  // [P]
     at::Tensor out_alpha,  // [P]
     at::Tensor out_normal  // [P, 3] (0-size when !sample_normals)
 ) {
+    const bool median = (geometry_mode == 1);
     const uint32_t P = points2d.size(0);
     const uint32_t N = means2d.size(0);
     const uint32_t tile_height = tile_offsets.size(-2);
@@ -288,6 +298,7 @@ void launch_sample_geometry_3dgs_fwd_kernel(
                 reinterpret_cast<vec4 *>(ray_planes.data_ptr<scalar_t>()),
                 normals_ptr,
                 Ks.data_ptr<scalar_t>(),
+                geometry_mode,
                 image_width,
                 image_height,
                 tile_size,

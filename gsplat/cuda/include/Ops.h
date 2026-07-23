@@ -80,7 +80,8 @@ projection_ewa_3dgs_fused_fwd(
     const float radius_clip,
     const bool calc_compensations,
     const CameraModelType camera_model,
-    const bool render_geometry
+    const bool render_geometry,
+    const int geometry_mode
 );
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 projection_ewa_3dgs_fused_bwd(
@@ -104,6 +105,7 @@ projection_ewa_3dgs_fused_bwd(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
+    const int geometry_mode,                        // 0=RD, 1=MD, 2=PD
     const at::optional<at::Tensor> v_ray_planes,    // [..., C, N, 4] optional
     const at::optional<at::Tensor> v_normals,       // [..., C, N, 3] optional
     const bool viewmats_requires_grad
@@ -250,6 +252,7 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
+    at::Tensor,
     at::Tensor>
 rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
@@ -268,10 +271,11 @@ rasterize_to_pixels_3dgs_fwd(
     const at::Tensor flatten_ids,  // [n_isects]
     // geometry outputs
     const bool render_geometry,
-    const uint32_t reduction,
+    const int geometry_mode,
     const at::optional<at::Tensor> ray_planes, // [..., N, 4]
     const at::optional<at::Tensor> normals,    // [..., N, 3]
-    const at::optional<at::Tensor> Ks          // [..., 3, 3]
+    const at::optional<at::Tensor> Ks,         // [..., 3, 3]
+    const bool count_observe
 );
 std::tuple<
     at::Tensor,
@@ -306,7 +310,7 @@ rasterize_to_pixels_3dgs_bwd(
     bool absgrad,
     // geometry outputs
     const bool render_geometry,
-    const uint32_t reduction,
+    const int geometry_mode,
     const at::optional<at::Tensor> ray_planes,
     const at::optional<at::Tensor> normals,
     const at::optional<at::Tensor> Ks,
@@ -335,7 +339,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sample_geometry_3dgs_fwd(
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     const bool sample_normals,
-    const bool median
+    const int geometry_mode
 );
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -353,11 +357,27 @@ sample_geometry_3dgs_bwd(
     const at::Tensor tile_offsets,
     const at::Tensor flatten_ids,
     const bool sample_normals,
-    const bool median,
+    const int geometry_mode,
     const at::optional<at::Tensor> out_depth,
     const at::Tensor v_depth,
     const at::Tensor v_alpha,
     const at::optional<at::Tensor> v_normal
+);
+
+// Accumulate the opacity-volume transmittance at 3D query points under one
+// camera (see IntegrateTransmittance3DGSFwd.cu). Forward-only.
+at::Tensor integrate_transmittance_3dgs_fwd(
+    const at::Tensor points2d,   // [P, 2] query pixel coords (this camera)
+    const at::Tensor point_t,    // [P] query ray-distance ||p_cam||
+    const at::Tensor means2d,    // [N, 2]
+    const at::Tensor conics,     // [N, 3]
+    const at::Tensor opacities,  // [N]
+    const at::Tensor ray_planes, // [N, 4]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [tile_height, tile_width]
+    const at::Tensor flatten_ids   // [n_isects]
 );
 
 // Rasterize 3D Gaussian, but only return the indices of gaussians and pixels.

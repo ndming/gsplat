@@ -44,7 +44,8 @@ inline __device__ void compute_ray_plane_normal(
     const vec3 scale, // per-axis scale (already activated)
     const float fx,
     const float fy,
-    vec4 &ray_plane,  // out: {gx, gy, tc, rsigma}
+    const int geometry_mode, // 0=RD, 1=MD (both -> ray-plane); 2=PD (plane)
+    vec4 &ray_plane,  // out: {gx, gy, tc, rsigma}  (PD: {0,0,dist,0})
     vec3 &normal_out  // out: camera-space unit normal
 ) {
     const vec3 t = mean_c;
@@ -72,6 +73,25 @@ inline __device__ void compute_ray_plane_normal(
     if (sz < scale[min_id]) {
         min_id = 2;
     }
+
+    // PGSR unbiased plane depth: the per-Gaussian plane is the disk through the
+    // center with the smallest-scale axis as normal. rmin = min_id column of the
+    // standard body->world rotation (= min_id row of glm R, which is R_std^T);
+    // n_cam = R_cw * rmin (glm row-vec mult v*M = M^T*v, with W = R_cw^T). Oriented
+    // toward the camera; distance = |n_cam . mean_c|. Normal stays UNNORMALIZED
+    // (already unit) to match PGSR (no glm::normalize here).
+    if (geometry_mode == 2) {
+        vec3 rmin = {R[0][min_id], R[1][min_id], R[2][min_id]};
+        vec3 n_cam = rmin * W;
+        if (glm::dot(n_cam, mean_c) > 0.f) {
+            n_cam = -n_cam;
+        }
+        const float dist = fabsf(glm::dot(n_cam, mean_c));
+        ray_plane = {0.f, 0.f, dist, 0.f};
+        normal_out = n_cam;
+        return;
+    }
+
     const bool well_conditioned = scale[min_id] > 1e-7f;
 
     mat3 cov_cam_inv;
@@ -129,6 +149,7 @@ inline __device__ void compute_ray_plane_normal_vjp(
     const vec3 scale,
     const float fx,
     const float fy,
+    const int geometry_mode, // 0=RD, 1=MD, 2=PD
     const vec4 v_ray_plane, // {dL/dgx, dL/dgy, dL/dtc, -}
     const vec3 v_normal,    // dL/dnormal (camera space, unnormalized grad)
     vec3 &v_mean_c,         // out (added to)
@@ -168,6 +189,58 @@ inline __device__ void compute_ray_plane_normal_vjp(
     if (sz < scale[min_id]) {
         min_id = 2;
     }
+
+    // ---- PGSR plane-depth VJP -------------------------------------------------
+    // fwd: rmin = R_std[:,min_id] (= glm R's min_id row); n0 = rmin*W (= R_cw*rmin);
+    //      n_cam = flip*n0 (orient to cam); dist = -dot(n_cam, mean_c) (>=0).
+    // Scale gets NO gradient (argmin index detached). rmin(quat) is differentiated
+    // analytically per min_id, then chained through quaternion normalization.
+    if (geometry_mode == 2) {
+        vec3 rmin = {R[0][min_id], R[1][min_id], R[2][min_id]};
+        vec3 n0 = rmin * W;
+        const float flip = (glm::dot(n0, mean_c) > 0.f) ? -1.f : 1.f;
+        vec3 n_cam = n0 * flip;
+        const float dL_ddist = v_ray_plane[2];
+        // dist = -dot(n_cam, mean_c)
+        vec3 dL_dn_cam = v_normal - dL_ddist * mean_c;
+        v_mean_c += (-dL_ddist) * n_cam;
+        vec3 dL_dn0 = dL_dn_cam * flip;
+        vec3 dL_drmin = W * dL_dn0; // n0 = W^T*rmin => dL/drmin = W*dL/dn0
+
+        // d(rmin)/d(normalized quat), per min_id column of R_std(qr,qx,qy,qz).
+        const float g0 = dL_drmin.x, g1 = dL_drmin.y, g2 = dL_drmin.z;
+        vec4 dL_dqn = {0.f, 0.f, 0.f, 0.f};
+        if (min_id == 0) {
+            // rmin = (1-2y^2-2z^2, 2xy+2rz, 2xz-2ry)
+            dL_dqn[0] = g1 * (2.f * qz) + g2 * (-2.f * qy);
+            dL_dqn[1] = g1 * (2.f * qy) + g2 * (2.f * qz);
+            dL_dqn[2] = g0 * (-4.f * qy) + g1 * (2.f * qx) + g2 * (-2.f * qr);
+            dL_dqn[3] = g0 * (-4.f * qz) + g1 * (2.f * qr) + g2 * (2.f * qx);
+        } else if (min_id == 1) {
+            // rmin = (2xy-2rz, 1-2x^2-2z^2, 2yz+2rx)
+            dL_dqn[0] = g0 * (-2.f * qz) + g2 * (2.f * qx);
+            dL_dqn[1] = g0 * (2.f * qy) + g1 * (-4.f * qx) + g2 * (2.f * qr);
+            dL_dqn[2] = g0 * (2.f * qx) + g2 * (2.f * qz);
+            dL_dqn[3] = g0 * (-2.f * qr) + g1 * (-4.f * qz) + g2 * (2.f * qy);
+        } else {
+            // rmin = (2xz+2ry, 2yz-2rx, 1-2x^2-2y^2)
+            dL_dqn[0] = g0 * (2.f * qy) + g1 * (-2.f * qx);
+            dL_dqn[1] = g0 * (2.f * qz) + g1 * (-2.f * qr) + g2 * (-4.f * qx);
+            dL_dqn[2] = g0 * (2.f * qr) + g1 * (2.f * qz) + g2 * (-4.f * qy);
+            dL_dqn[3] = g0 * (2.f * qx) + g1 * (2.f * qy);
+        }
+        // backprop through quaternion normalization: dL/dq_raw
+        const vec4 q_n = {qr, qx, qy, qz};
+        const float qdot =
+            q_n[0] * dL_dqn[0] + q_n[1] * dL_dqn[1] + q_n[2] * dL_dqn[2] + q_n[3] * dL_dqn[3];
+        v_quat_out[0] = (dL_dqn[0] - q_n[0] * qdot) * qn;
+        v_quat_out[1] = (dL_dqn[1] - q_n[1] * qdot) * qn;
+        v_quat_out[2] = (dL_dqn[2] - q_n[2] * qdot) * qn;
+        v_quat_out[3] = (dL_dqn[3] - q_n[3] * qdot) * qn;
+        v_scale_out = {0.f, 0.f, 0.f};
+        return;
+    }
+
     const bool well_conditioned = scale[min_id] > 1e-7f;
 
     mat3 cov_cam_inv;
@@ -381,6 +454,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
     scalar_t *__restrict__ compensations,// [B, C, N] optional
     // geometry outputs, optional (written only when render_geometry)
     const bool render_geometry,
+    const int geometry_mode,             // 0=RD, 1=MD, 2=PD
     scalar_t *__restrict__ ray_planes,   // [B, C, N, 4] optional {gx,gy,tc,rsigma}
     scalar_t *__restrict__ normals       // [B, C, N, 3] optional (camera space)
 ) {
@@ -574,6 +648,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel(
             glm::make_vec3(scales),
             Ks[0],
             Ks[4],
+            geometry_mode,
             ray_plane,
             normal
         );
@@ -610,6 +685,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     at::Tensor conics,                      // [..., C, N, 3]
     at::optional<at::Tensor> compensations, // [..., C, N] optional
     const bool render_geometry,
+    const int geometry_mode,                // 0=RD, 1=MD, 2=PD
     at::optional<at::Tensor> ray_planes,    // [..., C, N, 4] optional
     at::optional<at::Tensor> normals        // [..., C, N, 3] optional
 ) {
@@ -665,6 +741,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
                         ? compensations.value().data_ptr<scalar_t>()
                         : nullptr,
                     render_geometry,
+                    geometry_mode,
                     render_geometry ? ray_planes.value().data_ptr<scalar_t>()
                                     : nullptr,
                     render_geometry ? normals.value().data_ptr<scalar_t>()
@@ -700,6 +777,7 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     const scalar_t *__restrict__ v_conics,        // [B, C, N, 3]
     const scalar_t *__restrict__ v_compensations, // [B, C, N] optional
     // geometry grad outputs (read only when non-null)
+    const int geometry_mode,                   // 0=RD, 1=MD, 2=PD
     const scalar_t *__restrict__ v_ray_planes, // [B, C, N, 4] optional
     const scalar_t *__restrict__ v_normals,    // [B, C, N, 3] optional
     // grad inputs
@@ -863,8 +941,8 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
         compute_ray_plane_normal_vjp(
             // Must match the forward: pass the transposed W2C rotation (see the
             // compute_ray_plane_normal call in the forward kernel).
-            mean_c, glm::transpose(R), quat, scale, Ks[0], Ks[4], v_rp, v_nrm, v_mean_c,
-            v_scale_geo, v_quat_geo
+            mean_c, glm::transpose(R), quat, scale, Ks[0], Ks[4], geometry_mode, v_rp,
+            v_nrm, v_mean_c, v_scale_geo, v_quat_geo
         );
     }
 
@@ -965,6 +1043,7 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
     const at::Tensor v_depths,                      // [..., C, N]
     const at::Tensor v_conics,                      // [..., C, N, 3]
     const at::optional<at::Tensor> v_compensations, // [..., C, N] optional
+    const int geometry_mode,                        // 0=RD, 1=MD, 2=PD
     const at::optional<at::Tensor> v_ray_planes,    // [..., C, N, 4] optional
     const at::optional<at::Tensor> v_normals,       // [..., C, N, 3] optional
     const bool viewmats_requires_grad,
@@ -1025,6 +1104,7 @@ void launch_projection_ewa_3dgs_fused_bwd_kernel(
                     v_compensations.has_value()
                         ? v_compensations.value().data_ptr<scalar_t>()
                         : nullptr,
+                    geometry_mode,
                     v_ray_planes.has_value()
                         ? v_ray_planes.value().data_ptr<scalar_t>()
                         : nullptr,

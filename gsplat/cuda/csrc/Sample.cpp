@@ -43,7 +43,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sample_geometry_3dgs_fwd(
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     const bool sample_normals,
-    const bool median
+    const int geometry_mode
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(points2d);
@@ -80,7 +80,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sample_geometry_3dgs_fwd(
         tile_offsets,
         flatten_ids,
         sample_normals,
-        median,
+        geometry_mode,
         out_depth,
         out_alpha,
         out_normal
@@ -104,12 +104,13 @@ sample_geometry_3dgs_bwd(
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     const bool sample_normals,
-    const bool median,
+    const int geometry_mode,
     const at::optional<at::Tensor> out_depth, // forward depth (median z, for MEDIAN bwd)
     const at::Tensor v_depth,      // [P]
     const at::Tensor v_alpha,      // [P]
     const at::optional<at::Tensor> v_normal // [P, 3]
 ) {
+    const bool median = (geometry_mode == 1);
     DEVICE_GUARD(means2d);
     CHECK_INPUT(points2d);
     CHECK_INPUT(means2d);
@@ -147,7 +148,7 @@ sample_geometry_3dgs_bwd(
     launch_sample_geometry_3dgs_bwd_kernel(
         points2d, means2d, conics, opacities, ray_planes, normals, Ks,
         image_width, image_height, tile_size, tile_offsets, flatten_ids,
-        sample_normals, median, out_depth, v_depth, v_alpha, v_normal,
+        sample_normals, geometry_mode, out_depth, v_depth, v_alpha, v_normal,
         v_means2d, v_conics, v_opacities, v_ray_planes, v_normals, v_points2d
     );
 

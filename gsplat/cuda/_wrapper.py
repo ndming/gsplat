@@ -319,6 +319,7 @@ def fully_fused_projection(
     camera_model: Literal["pinhole", "ortho", "fisheye", "ftheta"] = "pinhole",
     opacities: Optional[Tensor] = None,  # [..., N] or None
     render_geometry: bool = False,
+    geometry_mode: int = 0,  # 0=RD, 1=MD, 2=PD
 ) -> Tuple[Tensor, ...]:
     """Projects Gaussians to 2D.
 
@@ -457,6 +458,7 @@ def fully_fused_projection(
             camera_model,
             opacities,
             render_geometry,
+            geometry_mode,
         )
         if render_geometry:
             return results  # (radii, means2d, depths, conics, compensations, ray_planes, normals)
@@ -582,7 +584,8 @@ def rasterize_to_pixels(
     normals: Optional[Tensor] = None,  # [..., N, 3]
     Ks: Optional[Tensor] = None,  # [..., 3, 3]
     render_geometry: bool = False,
-    reduction: int = 0,  # median flavor: 0 = T>0.5 crossing, 1 = opacity-volume
+    geometry_mode: int = 0,  # 0=RD, 1=MD, 2=PD
+    count_observe: bool = False,  # also return per-Gaussian T>0.5 contribution counts
 ) -> Tuple[Tensor, ...]:
     """Rasterizes Gaussians to pixels.
 
@@ -698,6 +701,7 @@ def rasterize_to_pixels(
         render_normals,
         render_depths,
         render_medians,
+        out_observe,
     ) = _RasterizeToPixels.apply(
         means2d.contiguous(),
         conics.contiguous(),
@@ -715,13 +719,17 @@ def rasterize_to_pixels(
         normals.contiguous() if normals is not None else None,
         Ks.contiguous() if Ks is not None else None,
         render_geometry,
-        reduction,
+        geometry_mode,
+        count_observe,
     )
 
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
     if render_geometry:
-        return render_colors, render_alphas, render_normals, render_depths, render_medians
+        return (render_colors, render_alphas, render_normals, render_depths,
+                render_medians, out_observe)
+    if count_observe:
+        return render_colors, render_alphas, out_observe
     return render_colors, render_alphas
 
 
@@ -1099,6 +1107,7 @@ class _FullyFusedProjection(torch.autograd.Function):
         camera_model: Literal["pinhole", "ortho", "fisheye", "ftheta"] = "pinhole",
         opacities: Optional[Tensor] = None,  # [..., N] or None
         render_geometry: bool = False,
+        geometry_mode: int = 0,  # 0=RD, 1=MD, 2=PD
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         assert (
             camera_model != "ftheta"
@@ -1134,6 +1143,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             calc_compensations,
             camera_model_type,
             render_geometry,
+            geometry_mode,
         )
         if not calc_compensations:
             compensations = None
@@ -1148,6 +1158,7 @@ class _FullyFusedProjection(torch.autograd.Function):
         ctx.eps2d = eps2d
         ctx.camera_model_type = camera_model_type
         ctx.render_geometry = render_geometry
+        ctx.geometry_mode = geometry_mode
 
         return radii, means2d, depths, conics, compensations, ray_planes, normals
 
@@ -1204,6 +1215,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             v_depths.contiguous(),
             v_conics.contiguous(),
             v_compensations,
+            ctx.geometry_mode,
             v_ray_planes,
             v_normals,
             ctx.needs_input_grad[4],  # viewmats_requires_grad
@@ -1236,6 +1248,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             None,
             None,
             None,  # render_geometry
+            None,  # geometry_mode
         )
 
 
@@ -1349,8 +1362,9 @@ class _RasterizeToPixels(torch.autograd.Function):
         normals: Optional[Tensor],  # [..., N, 3]
         Ks: Optional[Tensor],  # [..., 3, 3]
         render_geometry: bool,
-        reduction: int,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        geometry_mode: int,
+        count_observe: bool,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         (
             render_colors,
             render_alphas,
@@ -1360,6 +1374,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             render_medians,
             normal_length,
             median_ids,
+            out_observe,
         ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_fwd")(
             means2d,
             conics,
@@ -1373,10 +1388,11 @@ class _RasterizeToPixels(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             render_geometry,
-            reduction,
+            geometry_mode,
             ray_planes,
             normals,
             Ks,
+            count_observe,
         )
 
         ctx.save_for_backward(
@@ -1404,13 +1420,15 @@ class _RasterizeToPixels(torch.autograd.Function):
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
         ctx.render_geometry = render_geometry
-        ctx.reduction = reduction
+        ctx.geometry_mode = geometry_mode
 
         # double to float
         render_alphas = render_alphas.float()
+        # out_observe is a non-differentiable auxiliary output (0-size when not requested)
         if not render_geometry:
-            return render_colors, render_alphas, None, None, None
-        return render_colors, render_alphas, render_normals, render_depths, render_medians
+            return render_colors, render_alphas, None, None, None, out_observe
+        return (render_colors, render_alphas, render_normals, render_depths,
+                render_medians, out_observe)
 
     @staticmethod
     def backward(
@@ -1420,6 +1438,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         v_render_normals: Tensor,  # [..., H, W, 3] or None
         v_render_depths: Tensor,  # [..., H, W, 1] or None
         v_render_medians: Tensor,  # [..., H, W, 1] or None
+        v_out_observe: Tensor,    # unused (non-differentiable count)
     ):
         (
             means2d,
@@ -1446,7 +1465,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
         render_geometry = ctx.render_geometry
-        reduction = ctx.reduction
+        geometry_mode = ctx.geometry_mode
 
         (
             v_means2d_abs,
@@ -1474,7 +1493,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_render_alphas.contiguous(),
             absgrad,
             render_geometry,
-            reduction,
+            geometry_mode,
             ray_planes,
             normals,
             Ks,
@@ -1515,7 +1534,8 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_normals if render_geometry else None,      # normals
             None,  # Ks
             None,  # render_geometry
-            None,  # reduction
+            None,  # geometry_mode
+            None,  # count_observe
         )
 
 
@@ -2763,7 +2783,7 @@ def sample_geometry(
     isect_offsets: Tensor,  # [tile_height, tile_width]
     flatten_ids: Tensor,    # [n_isects]
     normals: Optional[Tensor] = None,  # [N, 3]; enables normal sampling when given
-    median: bool = False,   # sample the opacity-volume median depth instead of the mean
+    geometry_mode: int = 0,  # 0=RD (expected), 1=MD (median), 2=PD (plane)
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Sample the surface depth (and optionally camera-space normal) at arbitrary
     query pixels, reusing a precomputed per-tile Gaussian intersection. Differentiable
@@ -2787,7 +2807,41 @@ def sample_geometry(
         tile_size,
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
-        median,
+        geometry_mode,
+    )
+
+
+def integrate_transmittance(
+    points2d: Tensor,      # [P, 2] query pixel coords in the camera
+    point_t: Tensor,       # [P] query ray-distance (||p_cam||)
+    means2d: Tensor,       # [N, 2]
+    conics: Tensor,        # [N, 3]
+    opacities: Tensor,     # [N]
+    ray_planes: Tensor,    # [N, 4]
+    width: int,
+    height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [tile_height, tile_width]
+    flatten_ids: Tensor,    # [n_isects]
+) -> Tensor:
+    """Accumulate the opacity-volume transmittance at query points, reusing a
+    precomputed per-tile Gaussian intersection. Forward-only (no autograd).
+
+    Returns:
+        transmittance: [P] in [0, 1]; 0 for out-of-image query points.
+    """
+    return _make_lazy_cuda_func("integrate_transmittance_3dgs_fwd")(
+        points2d.contiguous(),
+        point_t.contiguous(),
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        ray_planes.contiguous(),
+        width,
+        height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
     )
 
 
@@ -2809,7 +2863,7 @@ class _SampleGeometry(torch.autograd.Function):
         tile_size: int,
         isect_offsets: Tensor,
         flatten_ids: Tensor,
-        median: bool,
+        geometry_mode: int,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         sample_normals = normals is not None
         depth, alpha, normal = _make_lazy_cuda_func("sample_geometry_3dgs_fwd")(
@@ -2826,7 +2880,7 @@ class _SampleGeometry(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             sample_normals,
-            median,
+            geometry_mode,
         )
         ctx.save_for_backward(
             points2d, means2d, conics, opacities, ray_planes, normals, Ks,
@@ -2836,7 +2890,7 @@ class _SampleGeometry(torch.autograd.Function):
         ctx.height = height
         ctx.tile_size = tile_size
         ctx.sample_normals = sample_normals
-        ctx.median = median
+        ctx.geometry_mode = geometry_mode
         return depth, alpha, normal
 
     @staticmethod
@@ -2846,7 +2900,7 @@ class _SampleGeometry(torch.autograd.Function):
             isect_offsets, flatten_ids, out_depth,
         ) = ctx.saved_tensors
         sample_normals = ctx.sample_normals
-        median = ctx.median
+        geometry_mode = ctx.geometry_mode
         v_depth = v_depth.contiguous()
         v_alpha = v_alpha.contiguous()
         v_normal = v_normal.contiguous() if sample_normals else None
@@ -2867,8 +2921,8 @@ class _SampleGeometry(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             sample_normals,
-            median,
-            out_depth if median else None,
+            geometry_mode,
+            out_depth if geometry_mode == 1 else None,
             v_depth,
             v_alpha,
             v_normal,
@@ -2887,5 +2941,5 @@ class _SampleGeometry(torch.autograd.Function):
             None,                                      # tile_size
             None,                                      # isect_offsets
             None,                                      # flatten_ids
-            None,                                      # median
+            None,                                      # geometry_mode
         )
