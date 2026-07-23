@@ -1,5 +1,7 @@
 import math
 from typing import Tuple
+
+import torch
 from torch import Tensor
 
 from .cuda._wrapper import (
@@ -7,6 +9,7 @@ from .cuda._wrapper import (
     isect_offset_encode,
     isect_tiles,
     sample_geometry as _sample_geometry_op,
+    integrate_transmittance as _integrate_op,
 )
 
 
@@ -25,7 +28,7 @@ def sample_geometry(
     eps2d: float = 0.3,
     tile_size: int = 16,
     sample_normals: bool = False,
-    reduction: int = 0,
+    geometry_mode: int = 0,  # 0=RD (expected), 1=MD (median), 2=PD (PGSR plane depth)
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Sample the primary surface depth (and optionally camera-space normal)
     at arbitrary query pixels in a single camera.
@@ -102,6 +105,7 @@ def sample_geometry(
         far_plane=far_plane,
         opacities=opacities,
         render_geometry=True,
+        geometry_mode=geometry_mode,
     )
     tile_w = math.ceil(width / tile_size)
     tile_h = math.ceil(height / tile_size)
@@ -121,5 +125,107 @@ def sample_geometry(
         isect_offsets[0],
         flatten_ids,
         normals=normals[0] if sample_normals else None,
-        median=(reduction == 1),
+        geometry_mode=geometry_mode,
     )
+
+
+def integrate_transmittance(
+    means: Tensor,        # [N, 3]
+    quats: Tensor,        # [N, 4]
+    scales: Tensor,       # [N, 3]
+    opacities: Tensor,    # [N]
+    viewmats: Tensor,     # [1, 4, 4] or [4, 4]
+    Ks: Tensor,           # [1, 3, 3] or [3, 3]
+    width: int,
+    height: int,
+    points3d: Tensor,     # [P, 3] world-space query points
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    eps2d: float = 0.3,
+    tile_size: int = 16,
+) -> Tuple[Tensor, Tensor]:
+    """Accumulate the opacity-volume transmittance of the Gaussians at arbitrary
+    3D query points in a single camera.
+
+    For each query point the transmittance is the product, over the Gaussians its
+    camera ray passes through, of the same opacity-volume factor used by the
+    median-depth render, evaluated at the point's own depth (see
+    :mod:`IntegrateTransmittance3DGSFwd.cu`). The signed field ``transmittance -
+    0.5`` places the surface at the 0.5 level set, which tetrahedra-based
+    extraction triangulates. Forward-only (intended for use under ``no_grad``).
+
+    Any world-space (3D Mip) filter is *not* applied here; dilate
+    ``scales``/``opacities`` before calling if the render being matched uses it.
+
+    Args:
+        means/quats/scales/opacities: Gaussian parameters (already activated).
+        viewmats: World-to-camera transform. ``[1, 4, 4]`` or ``[4, 4]``.
+        Ks: Pinhole intrinsics. ``[1, 3, 3]`` or ``[3, 3]``.
+        width/height: Image bounds (define the tile grid).
+        points3d: World-space query points. ``[P, 3]``.
+        near_plane/far_plane: Clip planes for the Gaussian projection; ``near_plane``
+            also culls query points in front of it.
+        eps2d: 2D screen-space covariance dilation (match the render being probed).
+        tile_size: Tile edge length; must match the binning; ``16`` is the default.
+
+    Returns:
+        A tuple ``(transmittance, inside)``:
+
+        - ``transmittance``: ``[P]`` in ``[0, 1]``; ``0`` where the point is out of
+          image or behind the near plane (i.e. fully occluded, ``sdf < 0``).
+        - ``inside``: ``[P]`` bool; whether the point projected in-image and in
+          front of the near plane (usable to drop never-observed points).
+    """
+    if viewmats.dim() == 3:
+        viewmats = viewmats[0]
+    if Ks.dim() == 3:
+        Ks = Ks[0]
+
+    # Project + tile-bin the Gaussians into this camera (depth-sorted per tile).
+    radii, means2d, depths, conics, _, ray_planes, _ = fully_fused_projection(
+        means,
+        None,  # covars: use quats/scales instead
+        quats,
+        scales,
+        viewmats[None],
+        Ks[None],
+        width,
+        height,
+        eps2d=eps2d,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        opacities=opacities,
+        render_geometry=True,
+    )
+    tile_w = math.ceil(width / tile_size)
+    tile_h = math.ceil(height / tile_size)
+    _, isect_ids, flatten_ids = isect_tiles(means2d, radii, depths, tile_size, tile_w, tile_h)
+    isect_offsets = isect_offset_encode(isect_ids, 1, tile_w, tile_h)
+
+    # Project the query points into this camera: pixel coords + ray-distance
+    # (Euclidean ||p_cam||, the same metric as the Gaussian ray-plane depth).
+    p_cam = points3d @ viewmats[:3, :3].transpose(-1, -2) + viewmats[:3, 3]  # [P, 3]
+    z = p_cam[:, 2]
+    fx, fy, cx, cy = Ks[0, 0], Ks[1, 1], Ks[0, 2], Ks[1, 2]
+    u = fx * p_cam[:, 0] / z.clamp_min(1e-8) + cx
+    v = fy * p_cam[:, 1] / z.clamp_min(1e-8) + cy
+    point_t = p_cam.norm(dim=-1)  # [P]
+    inside = (z > near_plane) & (u >= 0) & (u <= width - 1) & (v >= 0) & (v <= height - 1)
+    points2d = torch.stack([u, v], dim=-1)
+    # Route culled points out of image so the kernel returns 0 transmittance for them.
+    points2d = torch.where(inside[:, None], points2d, torch.full_like(points2d, -1.0))
+
+    transmittance = _integrate_op(
+        points2d,
+        point_t,
+        means2d[0],
+        conics[0],
+        opacities,
+        ray_planes[0],
+        width,
+        height,
+        tile_size,
+        isect_offsets[0],
+        flatten_ids,
+    )
+    return transmittance, inside
