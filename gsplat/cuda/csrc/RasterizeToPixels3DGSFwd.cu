@@ -59,7 +59,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const scalar_t *__restrict__ ray_planes, // [I, N, 4] or [nnz, 4]
     const scalar_t *__restrict__ normals,    // [I, N, 3] or [nnz, 3]
     const scalar_t *__restrict__ Ks,         // [I, 3, 3]
-    const int geometry_mode,                 // 0=RD, 1=MD, 2=PD
+    const int geometry_mode,                 // 0=RD, 1=MD, 2=PD, 3=WD
     scalar_t
         *__restrict__ render_colors, // [I, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [I, image_height, image_width, 1]
@@ -285,6 +285,11 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     // ray-distance; converted to z-depth (via rln) at write time.
     float oav_median = 0.f;
     if constexpr (GEOMETRY && MEDIAN) {
+        // Reciprocal variant (geometry_mode == 3): omit the per-sub-step
+        // normalization (the 1/sqrt(1 - alpha*g) factor), so each primitive
+        // acts as a one-sided occluder rather than a symmetric half-split.
+        const bool reciprocal = (geometry_mode == 3);
+
         constexpr int OAV_SPLIT = 8;         // sub-intervals per refinement
         constexpr int OAV_ITERS = 5;         // refinement iterations
         constexpr float OAV_RANGE = 0.4f;    // initial +/- search window (ray-dist)
@@ -359,8 +364,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
                         const float dl = (ts - t_peak) * rsigma;
                         const float gg = ball ? __expf(-0.5f * dl * dl) : 0.f;
                         const float omg = 1.f - alpha * gg;
-                        const float rvac = rsqrtf(omg);
-                        T_p[s] *= (ts > t_peak ? (1.f - alpha) : omg) * rvac;
+                        float fac = (ts > t_peak) ? (1.f - alpha) : omg;
+                        if (!reciprocal) fac *= rsqrtf(omg);
+                        T_p[s] *= fac;
                     }
                 }
             }
@@ -466,7 +472,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     at::Tensor last_ids, // [..., image_height, image_width]
     // geometry outputs; ignored unless render_geometry
     const bool render_geometry,
-    const int geometry_mode,                       // 0=RD, 1=MD (opacity-volume), 2=PD (plane)
+    const int geometry_mode,                       // 0=RD, 1=MD (opacity-volume), 2=PD (plane), 3=WD (reciprocal median)
     const at::optional<at::Tensor> ray_planes,     // [..., N, 4]
     const at::optional<at::Tensor> normals_in,     // [..., N, 3]
     const at::optional<at::Tensor> Ks,             // [..., 3, 3]
@@ -571,7 +577,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     if (render_geometry) {
         // Geometry rendering is only compiled/allowed for RGB (3 channels).
         if constexpr (CDIM == 3) {
-            if (geometry_mode == 1) {
+            if (geometry_mode == 1 || geometry_mode == 3) {
+                // Modes 1 and 3 both run the opacity-volume level-set search;
+                // mode 3 drops the per-sub-step normalization (chosen at runtime
+                // inside the kernel), giving the reciprocal one-sided variant.
                 __RD_LAUNCH__(true, true);
             } else {
                 // RD (0) and PD (2) both use MEDIAN=false; PD switches the depth

@@ -56,7 +56,7 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
     const vec4 *__restrict__ ray_planes, // [N, 4] {gx, gy, tc, rsigma}
     const vec3 *__restrict__ normals,    // [N, 3] read only when SAMPLE_NORMALS
     const scalar_t *__restrict__ Ks,     // [9] pinhole intrinsics
-    const int geometry_mode,             // 0=RD, 1=MD, 2=PD
+    const int geometry_mode,             // 0=RD, 1=MD, 2=PD, 3=WD
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
@@ -156,6 +156,11 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
     } else if constexpr (MEDIAN) {
         // Opacity-volume level-set median over this pixel's contributing splats
         // (per-point binary search). Works in ray-distance; -> z-depth via rln.
+
+        // Reciprocal variant (geometry_mode == 3) drops the per-sub-step 1/sqrt
+        // normalization for a one-sided accumulation.
+        const bool reciprocal = (geometry_mode == 3);
+
         constexpr int OAV_SPLIT = 8;
         constexpr int OAV_ITERS = 5;
         constexpr float OAV_RANGE = 0.4f;
@@ -198,8 +203,9 @@ __global__ void sample_geometry_3dgs_fwd_kernel(
                         const float dl = (ts - t_peak) * rsigma;
                         const float gg = ball ? __expf(-0.5f * dl * dl) : 0.f;
                         const float omg = 1.f - alpha * gg;
-                        const float rvac = rsqrtf(omg);
-                        T_p[s] *= (ts > t_peak ? (1.f - alpha) : omg) * rvac;
+                        float fac = (ts > t_peak) ? (1.f - alpha) : omg;
+                        if (!reciprocal) fac *= rsqrtf(omg);
+                        T_p[s] *= fac;
                     }
                 }
                 if (first) {
@@ -252,13 +258,13 @@ void launch_sample_geometry_3dgs_fwd_kernel(
     const at::Tensor tile_offsets, // [tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     const bool sample_normals,
-    const int geometry_mode,   // 0=RD, 1=MD, 2=PD
+    const int geometry_mode,   // 0=RD, 1=MD, 2=PD, 3=WD
     // outputs
     at::Tensor out_depth,  // [P]
     at::Tensor out_alpha,  // [P]
     at::Tensor out_normal  // [P, 3] (0-size when !sample_normals)
 ) {
-    const bool median = (geometry_mode == 1);
+    const bool median = (geometry_mode == 1 || geometry_mode == 3);
     const uint32_t P = points2d.size(0);
     const uint32_t N = means2d.size(0);
     const uint32_t tile_height = tile_offsets.size(-2);

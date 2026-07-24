@@ -138,7 +138,7 @@ def rasterization(
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
-    render_mode: Literal["RGB", "ZD", "RGB+ZD", "RGB+RD", "RGB+MD", "RGB+PD"] = "RGB",
+    render_mode: Literal["RGB", "ZD", "RGB+ZD", "RGB+RD", "RGB+MD", "RGB+PD", "RGB+WD"] = "RGB",
     count_observe: bool = False,
     sparse_grad: bool = False,
     absgrad: bool = False,
@@ -191,12 +191,17 @@ def rasterization(
         activated bases in the SH coefficients.
 
     .. note::
-        **Depth Rendering**: This function supports colors or/and depths via `render_mode`.
-        The supported modes are "RGB", "D", "ED", "RGB+D", and "RGB+ED". "RGB" renders the
-        colored image that respects the `colors` argument. "D" renders the accumulated z-depth
-        :math:`\\sum_i w_i z_i`. "ED" renders the expected z-depth
-        :math:`\\frac{\\sum_i w_i z_i}{\\sum_i w_i}`. "RGB+D" and "RGB+ED" render both
-        the colored image and the depth, in which the depth is the last channel of the output.
+        **Depth Rendering**: This function supports colors or/and advanced depths rendering via `render_mode`.
+        The supported modes are "RGB", "ZD", "RGB+ZD", "RGB+RD", "RGB+MD", "RGB+PD", and "RGB+WD". "RGB" renders
+        the colored image that respects the `colors` argument. "ZD" renders the expected and accumulated z-depth,
+        concatenated into the output's channel 0 and 1, repspectively. "RGB+ZD" renders both, in which the depths
+        are the last two channels of the output, same ordering. The remaining modes are geometric modes where,
+        aside from rendered colors and depths in the first 5 channels, the output also gets rendered normals:
+        output = RGB[0:3] | primary[3:4] | secondary[4:5] | normal[5:8]
+        - "RD": ray-plane intersection depth as described in RaDe-GS, primary is expected depth and secondary is median depth
+        - "MD": principled median depth as described in GGGS, primary is median depth and secondary is expected depth
+        - "PD": unbiased plane depth as described in PGSR, primary is plane depth and secondary is rendered distance
+        - "WD": reciprocal median depth as described in Gaussian Wrapping, same layout as MD
 
     .. note::
         **Memory-Speed Trade-off**: The `packed` argument provides a trade-off between
@@ -275,9 +280,8 @@ def rasterization(
         tile_size: The size of the tiles for rasterization. Default is 16.
             (Note: other values are not tested)
         backgrounds: The background colors. [..., C, D]. Default is None.
-        render_mode: The rendering mode. Supported modes are "RGB", "D", "ED", "RGB+D",
-            and "RGB+ED". "RGB" renders the colored image, "D" renders the accumulated depth, and
-            "ED" renders the expected depth. Default is "RGB".
+        render_mode: The rendering mode. Supported modes are "RGB", "ZD", "RGB+ZD",
+            "RGB+RD", "RGB+MD", "RGB+PD", and "RGB+WD". Default is "RGB".
         count_observe: Whether to return per-Gaussian T>0.5 counts in meta
         sparse_grad: If true, the gradients for {means, quats, scales} will be stored in
             a COO sparse layout. This can be helpful for saving memory. Default is False.
@@ -320,9 +324,7 @@ def rasterization(
         A tuple:
 
         **render_colors**: The rendered colors. [..., C, height, width, X].
-        X depends on the `render_mode` and input `colors`. If `render_mode` is "RGB",
-        X is D; if `render_mode` is "D" or "ED", X is 1; if `render_mode` is "RGB+D" or
-        "RGB+ED", X is D+1.
+        X depends on the `render_mode` and input `colors`.
 
         **render_alphas**: The rendered alphas. [..., C, height, width, 1].
 
@@ -378,19 +380,22 @@ def rasterization(
     assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
     assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
     assert render_mode in [
-        "RGB",
-        "ZD",
+        "RGB", "ZD",
         "RGB+ZD",
         "RGB+RD",
         "RGB+MD",
         "RGB+PD",
+        "RGB+WD",
     ], render_mode
 
     # Rendering geometry (depths and normals) impose a few restrictions
     render_geometry = render_mode in ["RGB+RD", "RGB+PD", "RGB+MD", "RGB+WD"]
-    # Geometry mode selects the depth formulation: RD (RaDe ray-plane expected),
-    # MD (opacity-volume median), PD (PGSR unbiased plane depth).
-    geometry_mode = {"RGB+RD": 0, "RGB+MD": 1, "RGB+PD": 2}.get(render_mode, 0)
+    # Geometry mode selects the depth formulation:
+    # 0 = ray-plane expected depth
+    # 2 = unbiased plane depth
+    # 1 = opacity-volume level-set median
+    # 3 = reciprocal median (median with the per-sub-step normalization dropped)
+    geometry_mode = {"RGB+RD": 0, "RGB+MD": 1, "RGB+PD": 2, "RGB+WD": 3}.get(render_mode, 0)
     if render_geometry:
         assert camera_model == "pinhole", "Geometry rendering requires the pinhole camera model"
         assert not packed, "Geometry rendering is not supported in packed mode"
@@ -825,14 +830,16 @@ def rasterization(
             normals=normals,
             Ks=Ks,
             render_geometry=True,
-            # 0=RD (expected), 1=MD (opacity-volume median), 2=PD (PGSR plane depth).
-            geometry_mode=geometry_mode,
+            geometry_mode=geometry_mode,  # 0=RD, 1=MD, 2=PD, 3=WD
             count_observe=count_observe,
         )
+
         # Multi-view observe-trim per-Gaussian counter (0-size unless count_observe).
         meta["out_observe"] = out_observe
-        # Channel layout is [RGB(0:3), primary depth(3), secondary depth(4), normal(5:8)].
-        if render_mode == "RGB+MD":
+
+        # Median-primary modes (opacity-volume median and its reciprocal variant)
+        # put the level-set depth in ch3 and the expected depth in ch4.
+        if render_mode in ("RGB+MD", "RGB+WD"):
             render_colors = torch.cat(
                 [render_colors, render_medians, render_depths, render_normals], dim=-1
             )  # [..., C, H, W, 8]
@@ -840,6 +847,8 @@ def rasterization(
             render_colors = torch.cat(
                 [render_colors, render_depths, render_medians, render_normals], dim=-1
             )  # [..., C, H, W, 8]
+
+        # Channel layout is [RGB(0:3), primary depth(3), secondary depth(4), normal(5:8)].
         return render_colors, render_alphas, meta
 
     # print("rank", world_rank, "Before rasterize_to_pixels")

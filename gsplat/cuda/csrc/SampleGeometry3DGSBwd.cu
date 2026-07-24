@@ -52,7 +52,7 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
     const vec4 *__restrict__ ray_planes, // [N, 4]
     const vec3 *__restrict__ normals,    // [N, 3] read only when SAMPLE_NORMALS
     const scalar_t *__restrict__ Ks,     // [9]
-    const int geometry_mode,             // 0=RD, 1=MD, 2=PD
+    const int geometry_mode,             // 0=RD, 1=MD, 2=PD, 3=WD
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
@@ -149,7 +149,10 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
     float grln = 0.f;           // grad on rln (-> query pixel)
     float mDepth = 0.f;         // MEDIAN: forward median in ray-distance
     float dL_dmt_dT_dtm = 0.f;  // MEDIAN: dL/d(median) / (-dT/d ts)
-    // PGSR unbiased plane depth: out_depth = D / -(Nrm.ray + eps). alpha and rln
+    // Reciprocal (one-sided) level-set variant: drops the per-sub-step 1/sqrt
+    // normalization (see the forward). Only front-side primitives vary the depth.
+    const bool reciprocal = (geometry_mode == 3);
+    // Unbiased plane depth: out_depth = D / -(Nrm.ray + eps). alpha and rln
     // cancel; the normal seed gets the denominator's Nrm dependence. Query-pixel
     // (points2d) grad from the PD ray is not propagated (grln=0): the multi-view
     // neighbour sample is used detached w.r.t. its query pixels.
@@ -190,7 +193,13 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
                 const float t_delta = (mDepth - t_peak) * rsigma;
                 const float G_exp = __expf(-0.5f * t_delta * t_delta);
                 const float Gt = alpha * G_exp;
-                dT_dtm += -0.25f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+                if (reciprocal) {
+                    if (t_peak >= mDepth && rsigma > 0.f) {
+                        dT_dtm += -0.5f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+                    }
+                } else {
+                    dT_dtm += -0.25f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+                }
             }
             dL_dmt_dT_dtm = gd * rln / fmaxf(-dT_dtm, 1e-7f); // dL_dpixel_mt / (-dT_dtm)
         }
@@ -262,21 +271,39 @@ __global__ void sample_geometry_3dgs_bwd_kernel(
         float dL_dt = w * dL_dpixel_t; // expected (0 when MEDIAN)
         float v_rsigma = 0.f;
         if constexpr (MEDIAN) {
-            // Opacity-volume median: implicit-function-theorem grad at mDepth.
+            // Implicit-function-theorem grad of the level-set depth at mDepth.
             const float rsigma = rp.w;
             const float t_delta = (mDepth - tt) * rsigma;
             const float G_exp = __expf(-0.5f * t_delta * t_delta);
             const float Gt = alpha * G_exp;
-            float dL_dGt = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
-            dL_dGt = (mDepth > tt) ? dL_dGt : -dL_dGt;
-            dL_dGt = (rsigma > 0.f) ? dL_dGt : 0.f;
-            const float dL_dopa_sigma =
-                dL_dGt * G_exp -
-                dL_dmt_dT_dtm * (t_delta > 0.f ? 0.5f / (1.f - alpha) : 0.f);
-            const float dL_ddelta = -dL_dGt * Gt * t_delta;
-            v_rsigma = dL_ddelta * (mDepth - tt);
-            dL_dt += -dL_ddelta * rsigma; // dL/dt_peak
-            v_a += dL_dopa_sigma;
+            if (reciprocal) {
+                // One-sided variant (see the forward): front primitives vary
+                // through omg; passed primitives contribute only (1 - alpha).
+                float dL_dopa_sigma;
+                if (mDepth > tt) {
+                    dL_dopa_sigma = -0.5f * dL_dmt_dT_dtm / (1.f - alpha);
+                } else if (rsigma > 0.f) {
+                    const float inv_omg = 1.f / (1.f - Gt);
+                    dL_dopa_sigma = -0.5f * dL_dmt_dT_dtm * G_exp * inv_omg;
+                    const float c = 0.5f * dL_dmt_dT_dtm * Gt * t_delta * inv_omg;
+                    dL_dt += -c * rsigma;         // dL/dt_peak
+                    v_rsigma = c * (mDepth - tt); // dL/drsigma
+                } else {
+                    dL_dopa_sigma = 0.f;
+                }
+                v_a += dL_dopa_sigma;
+            } else {
+                float dL_dGt = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
+                dL_dGt = (mDepth > tt) ? dL_dGt : -dL_dGt;
+                dL_dGt = (rsigma > 0.f) ? dL_dGt : 0.f;
+                const float dL_dopa_sigma =
+                    dL_dGt * G_exp -
+                    dL_dmt_dT_dtm * (t_delta > 0.f ? 0.5f / (1.f - alpha) : 0.f);
+                const float dL_ddelta = -dL_dGt * Gt * t_delta;
+                v_rsigma = dL_ddelta * (mDepth - tt);
+                dL_dt += -dL_ddelta * rsigma; // dL/dt_peak
+                v_a += dL_dopa_sigma;
+            }
         }
         vec4 v_rp_local = {dL_dt * delta.x, dL_dt * delta.y, dL_dt, v_rsigma};
         vec2 v_xy = {dL_dt * rp.x, dL_dt * rp.y};
@@ -369,7 +396,7 @@ void launch_sample_geometry_3dgs_bwd_kernel(
     at::optional<at::Tensor> v_normals,
     at::Tensor v_points2d
 ) {
-    const bool median = (geometry_mode == 1);
+    const bool median = (geometry_mode == 1 || geometry_mode == 3);
     const uint32_t P = points2d.size(0);
     const uint32_t N = means2d.size(0);
     const uint32_t tile_height = tile_offsets.size(-2);

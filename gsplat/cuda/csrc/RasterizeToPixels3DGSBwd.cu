@@ -259,6 +259,11 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     // back-to-front pass, compute per-pixel dT/dts at the median depth so the
     // per-Gaussian pass can scale its gradients. Block-cooperative (front-to-back
     // shared reloads); mDepth is the forward median in ray-distance.
+    // Reciprocal (one-sided) variant of the level-set gradient: the per-sub-step
+    // 1/sqrt normalization is dropped, so only primitives whose peak sits at or
+    // behind the level set vary the transmittance through their soft factor; those
+    // the level set has already passed contribute only via their (1 - alpha) factor.
+    const bool reciprocal = (geometry_mode == 3);
     float mDepth = 0.f;
     float dL_dmt_dT_dtm = 0.f;
     if constexpr (MEDIAN) {
@@ -321,7 +326,16 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                 const float t_delta = (mDepth - t_peak) * rsigma;
                 const float G_exp = __expf(-0.5f * t_delta * t_delta);
                 const float Gt = alpha * G_exp;
-                dT_dtm += -0.25f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+                if (reciprocal) {
+                    // Only the front side (peak at/behind the level set) varies
+                    // the transmittance w.r.t. the level-set depth; coefficient
+                    // 0.5 vs the symmetric variant's 0.25.
+                    if (t_peak >= mDepth && rsigma > 0.f) {
+                        dT_dtm += -0.5f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+                    }
+                } else {
+                    dT_dtm += -0.25f * Gt / (1.f - Gt) * fabsf(t_delta) * rsigma;
+                }
             }
         }
         dL_dmt_dT_dtm = dL_dpixel_mt / fmaxf(-dT_dtm, 1e-7f);
@@ -442,23 +456,43 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     v_alpha += (tt * T - buffer_t * ra) * dL_dpixel_t;
                     dL_dt = fac * dL_dpixel_t;
                     if constexpr (MEDIAN) {
-                        // Opacity-volume median: implicit-function-theorem grad at
-                        // the fixed per-pixel median depth (tt == t_peak).
+                        // Implicit-function-theorem gradient of the level-set depth
+                        // at the fixed per-pixel crossing (tt == t_peak).
                         const float rsigma = rp.w;
                         const float t_delta = (mDepth - tt) * rsigma;
                         const float G_exp = __expf(-0.5f * t_delta * t_delta);
                         const float Gt = alpha * G_exp;
-                        float dL_dGt = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
-                        dL_dGt = (mDepth > tt) ? dL_dGt : -dL_dGt;
-                        dL_dGt = (rsigma > 0.f) ? dL_dGt : 0.f;
-                        const float dL_dopa_sigma =
-                            dL_dGt * G_exp -
-                            dL_dmt_dT_dtm *
-                                (t_delta > 0.f ? 0.5f / (1.f - alpha) : 0.f);
-                        const float dL_ddelta = -dL_dGt * Gt * t_delta;
-                        v_rsigma_local = dL_ddelta * (mDepth - tt);
-                        dL_dt += -dL_ddelta * rsigma; // dL/dt_peak
-                        v_alpha += dL_dopa_sigma;
+                        if (reciprocal) {
+                            // One-sided variant. Front primitives (peak at/behind the
+                            // crossing, mDepth <= tt) vary through omg = 1 - alpha*g;
+                            // those the crossing has passed contribute only via their
+                            // (1 - alpha) factor (alpha gradient, no t_peak/rsigma).
+                            float dL_dopa_sigma;
+                            if (mDepth > tt) {
+                                dL_dopa_sigma = -0.5f * dL_dmt_dT_dtm / (1.f - alpha);
+                            } else if (rsigma > 0.f) {
+                                const float inv_omg = 1.f / (1.f - Gt);
+                                dL_dopa_sigma = -0.5f * dL_dmt_dT_dtm * G_exp * inv_omg;
+                                const float c = 0.5f * dL_dmt_dT_dtm * Gt * t_delta * inv_omg;
+                                dL_dt += -c * rsigma;                // dL/dt_peak
+                                v_rsigma_local = c * (mDepth - tt);  // dL/drsigma
+                            } else {
+                                dL_dopa_sigma = 0.f;
+                            }
+                            v_alpha += dL_dopa_sigma;
+                        } else {
+                            float dL_dGt = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
+                            dL_dGt = (mDepth > tt) ? dL_dGt : -dL_dGt;
+                            dL_dGt = (rsigma > 0.f) ? dL_dGt : 0.f;
+                            const float dL_dopa_sigma =
+                                dL_dGt * G_exp -
+                                dL_dmt_dT_dtm *
+                                    (t_delta > 0.f ? 0.5f / (1.f - alpha) : 0.f);
+                            const float dL_ddelta = -dL_dGt * Gt * t_delta;
+                            v_rsigma_local = dL_ddelta * (mDepth - tt);
+                            dL_dt += -dL_ddelta * rsigma; // dL/dt_peak
+                            v_alpha += dL_dopa_sigma;
+                        }
                     } else {
                         // Crossing median: route the median grad to the T>0.5 splat.
                         if ((batch_end - (int32_t)t) == median_ids[pix_id]) {
@@ -725,7 +759,9 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
 
     if (render_geometry) {
         if constexpr (CDIM == 3) {
-            if (geometry_mode == 1) {
+            // Modes 1 and 3 both use the opacity-volume level-set backward; mode 3
+            // (reciprocal) drops the per-sub-step normalization at runtime.
+            if (geometry_mode == 1 || geometry_mode == 3) {
                 __RD_BWD_LAUNCH__(true, true);
             } else {
                 __RD_BWD_LAUNCH__(true, false);

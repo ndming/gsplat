@@ -584,7 +584,7 @@ def rasterize_to_pixels(
     normals: Optional[Tensor] = None,  # [..., N, 3]
     Ks: Optional[Tensor] = None,  # [..., 3, 3]
     render_geometry: bool = False,
-    geometry_mode: int = 0,  # 0=RD, 1=MD, 2=PD
+    geometry_mode: int = 0,  # 0=RD, 1=MD, 2=PD, 3=WD
     count_observe: bool = False,  # also return per-Gaussian T>0.5 contribution counts
 ) -> Tuple[Tensor, ...]:
     """Rasterizes Gaussians to pixels.
@@ -2783,7 +2783,7 @@ def sample_geometry(
     isect_offsets: Tensor,  # [tile_height, tile_width]
     flatten_ids: Tensor,    # [n_isects]
     normals: Optional[Tensor] = None,  # [N, 3]; enables normal sampling when given
-    geometry_mode: int = 0,  # 0=RD (expected), 1=MD (median), 2=PD (plane)
+    geometry_mode: int = 0,  # 0=RD (expected), 1=MD (median), 2=PD (plane), 3=WD (reciprocal median)
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Sample the surface depth (and optionally camera-space normal) at arbitrary
     query pixels, reusing a precomputed per-tile Gaussian intersection. Differentiable
