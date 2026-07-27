@@ -287,20 +287,21 @@ inline __device__ void compute_ray_plane_normal_vjp(
         vec3 ray_normal_vector = {-plane.x * factor_normal, -plane.y * factor_normal, -1.f};
 
         vec3 cam_normal_vector = nJ * ray_normal_vector;
-        vec3 normal_vector = glm::normalize(cam_normal_vector);
-        // NOTE (deliberate): rlv is taken from the ALREADY-normalized normal_vector
-        // (so rlv ~= 1), NOT from the raw cam_normal_vector. The mathematically correct
-        // normalize-VJP factor is 1/|cam_normal_vector| (rsqrtf of the un-normalized
-        // vector); using ~1 drops that 1/|x|, over-weighting the normal gradient for
-        // tilted disks and flattening them harder. This matches the reference training
-        // dynamics on purpose; see the port notes before "fixing" it.
+
+        // NOTE: This differs from the original RaDe-GS / GGGS implementation.
+        // The reference code computed `rlv` from the already-normalized vector,
+        // making `rlv ≈ 1` and omitting the required 1/|cam_normal_vector| factor
+        // in the normalization VJP. That behavior is preserved only for exact
+        // reproduction of the original training dynamics. Here we instead use the
+        // mathematically correct normalization: d normalize(x) / dx = (I - nnᵀ) / |x|.
         const float rlv = rsqrtf(
-            normal_vector.x * normal_vector.x +
-            normal_vector.y * normal_vector.y +
-            normal_vector.z * normal_vector.z
+            cam_normal_vector.x * cam_normal_vector.x +
+            cam_normal_vector.y * cam_normal_vector.y +
+            cam_normal_vector.z * cam_normal_vector.z
         );
-        vec3 dL_dcam_normal_vector =
-            (v_normal - normal_vector * glm::dot(normal_vector, v_normal)) * rlv;
+        vec3 normal_vector = cam_normal_vector * rlv;
+
+        vec3 dL_dcam_normal_vector = (v_normal - normal_vector * glm::dot(normal_vector, v_normal)) * rlv;
         vec3 dL_dray_normal_vector = glm::transpose(nJ) * dL_dcam_normal_vector;
         mat3 dL_dnJ = glm::outerProduct(dL_dcam_normal_vector, ray_normal_vector);
         const float dL_dfactor_normal =
