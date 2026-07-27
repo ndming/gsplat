@@ -853,6 +853,9 @@ def rasterization(
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
     if colors.shape[-1] > channel_chunk:
+        assert (
+            not count_observe
+        ), f"count_observe cannot work for chunk rendering: color channels ({colors.shape[-1]}) > channel_chunk ({channel_chunk})"
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
         render_colors, render_alphas = [], []
@@ -930,7 +933,7 @@ def rasterization(
                 viewmats_rs=viewmats_rs,
             )
         else:
-            render_colors, render_alphas = rasterize_to_pixels(
+            render_package = rasterize_to_pixels(
                 means2d,
                 conics,
                 colors,
@@ -943,7 +946,14 @@ def rasterization(
                 backgrounds=backgrounds,
                 packed=packed,
                 absgrad=absgrad,
+                count_observe=count_observe,
             )
+            if count_observe:
+                render_colors, render_alphas, out_observe = render_package
+                meta["out_observe"] = out_observe
+            else:
+                render_colors, render_alphas = render_package
+
     if render_mode in ["ZD", "RGB+ZD"]:
         # The last rasterized channel is the accumulated depth D, we
         # expose both the expected depth and the accumulated depth D:
