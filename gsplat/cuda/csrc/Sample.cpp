@@ -110,7 +110,7 @@ sample_geometry_3dgs_bwd(
     const at::Tensor v_alpha,      // [P]
     const at::optional<at::Tensor> v_normal // [P, 3]
 ) {
-    const bool median = (geometry_mode == 1);
+    const bool median = (geometry_mode == 1 || geometry_mode == 3);
     DEVICE_GUARD(means2d);
     CHECK_INPUT(points2d);
     CHECK_INPUT(means2d);

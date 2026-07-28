@@ -2922,7 +2922,7 @@ class _SampleGeometry(torch.autograd.Function):
             flatten_ids,
             sample_normals,
             geometry_mode,
-            out_depth if geometry_mode == 1 else None,
+            out_depth if geometry_mode in (1, 3) else None,
             v_depth,
             v_alpha,
             v_normal,
