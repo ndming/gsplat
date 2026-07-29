@@ -382,6 +382,7 @@ def splat2ply_bytes(
     opacities: torch.Tensor,
     sh0: torch.Tensor,
     shN: torch.Tensor,
+    normals: torch.Tensor = None,
 ) -> bytes:
     """Return the binary Ply file. Supported by almost all viewers.
 
@@ -392,6 +393,7 @@ def splat2ply_bytes(
         opacities (torch.Tensor): Splat opacities. Shape (N,)
         sh0 (torch.Tensor): Spherical harmonics. Shape (N, 3)
         shN (torch.Tensor): Spherical harmonics. Shape (N, K*3)
+        normals (torch.Tensor): Normals. Shape (N, 3)
 
     Returns:
         bytes: Binary Ply file representing the model.
@@ -407,6 +409,10 @@ def splat2ply_bytes(
     buffer.write(b"property float x\n")
     buffer.write(b"property float y\n")
     buffer.write(b"property float z\n")
+    if normals is not None:
+        buffer.write(b"property float nx\n")
+        buffer.write(b"property float ny\n")
+        buffer.write(b"property float nz\n")
     for i, data in enumerate([sh0, shN]):
         prefix = "f_dc" if i == 0 else "f_rest"
         for j in range(data.shape[1]):
@@ -421,7 +427,10 @@ def splat2ply_bytes(
     # Concatenate all tensors in the correct order
     splat_data = torch.cat(
         [means, sh0, shN, opacities.unsqueeze(1), scales, quats], dim=1
+    ) if normals is None else torch.cat(
+        [means, normals, sh0, shN, opacities.unsqueeze(1), scales, quats], dim=1
     )
+
     # Ensure correct dtype
     splat_data = splat_data.to(torch.float32)
 
@@ -494,6 +503,7 @@ def export_splats(
     opacities: torch.Tensor,
     sh0: torch.Tensor,
     shN: torch.Tensor,
+    normals: torch.Tensor = None,
     format: Literal["ply", "splat", "ply_compressed"] = "ply",
     save_to: Optional[str] = None,
 ) -> bytes:
@@ -510,6 +520,7 @@ def export_splats(
         opacities (torch.Tensor): Splat opacities. Shape (N,)
         sh0 (torch.Tensor): Spherical harmonics. Shape (N, 1, 3)
         shN (torch.Tensor): Spherical harmonics. Shape (N, K, 3)
+        normals (torch.Tensor): Normal directions, for ply format only. Shape (N, 3)
         format (str): Export format. Options: "ply", "splat", "ply_compressed". Default: "ply"
         save_to (str): Output file path. If provided, the bytes will be written to file.
     """
@@ -522,6 +533,9 @@ def export_splats(
     assert (
         shN.ndim == 3 and shN.shape[0] == total_splats and shN.shape[2] == 3
     ), f"shN must be of shape (N, K, 3), got {shN.shape}"
+
+    if normals is not None:
+        assert normals.shape == (total_splats, 3), "Normals must be of shape (N, 3)"
 
     # Reshape spherical harmonics
     sh0 = sh0.squeeze(1)  # Shape (N, 3)
@@ -543,6 +557,10 @@ def export_splats(
         | torch.isinf(shN).any(dim=1)
     )
 
+    if normals is not None:
+        invalid_mask |= torch.isnan(normals).any(dim=1)
+        invalid_mask |= torch.isinf(normals).any(dim=1)
+
     # Filter out invalid entries
     valid_mask = ~invalid_mask
     means = means[valid_mask]
@@ -552,8 +570,11 @@ def export_splats(
     sh0 = sh0[valid_mask]
     shN = shN[valid_mask]
 
+    if normals is not None:
+        normals = normals[valid_mask]
+
     if format == "ply":
-        data = splat2ply_bytes(means, scales, quats, opacities, sh0, shN)
+        data = splat2ply_bytes(means, scales, quats, opacities, sh0, shN, normals)
     elif format == "splat":
         data = splat2splat_bytes(means, scales, quats, opacities, sh0)
     elif format == "ply_compressed":
