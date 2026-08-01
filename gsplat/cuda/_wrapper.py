@@ -701,6 +701,7 @@ def rasterize_to_pixels(
         render_normals,
         render_depths,
         render_medians,
+        median_ids,
         out_observe,
     ) = _RasterizeToPixels.apply(
         means2d.contiguous(),
@@ -727,7 +728,7 @@ def rasterize_to_pixels(
         render_colors = render_colors[..., :-padded_channels]
     if render_geometry:
         return (render_colors, render_alphas, render_normals, render_depths,
-                render_medians, out_observe)
+                render_medians, median_ids, out_observe)
     if count_observe:
         return render_colors, render_alphas, out_observe
     return render_colors, render_alphas
@@ -1364,7 +1365,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         render_geometry: bool,
         geometry_mode: int,
         count_observe: bool,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         (
             render_colors,
             render_alphas,
@@ -1424,11 +1425,11 @@ class _RasterizeToPixels(torch.autograd.Function):
 
         # double to float
         render_alphas = render_alphas.float()
-        # out_observe is a non-differentiable auxiliary output (0-size when not requested)
+        # median_ids and out_observe are non-differentiable auxiliary outputs (0-size when not requested)
         if not render_geometry:
-            return render_colors, render_alphas, None, None, None, out_observe
+            return render_colors, render_alphas, None, None, None, None, out_observe
         return (render_colors, render_alphas, render_normals, render_depths,
-                render_medians, out_observe)
+                render_medians, median_ids, out_observe)
 
     @staticmethod
     def backward(
@@ -1438,6 +1439,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         v_render_normals: Tensor,  # [..., H, W, 3] or None
         v_render_depths: Tensor,  # [..., H, W, 1] or None
         v_render_medians: Tensor,  # [..., H, W, 1] or None
+        v_median_ids: Tensor,     # unused (non-differentiable index)
         v_out_observe: Tensor,    # unused (non-differentiable count)
     ):
         (

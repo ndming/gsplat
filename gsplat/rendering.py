@@ -812,6 +812,7 @@ def rasterization(
             render_normals,
             render_depths,
             render_medians,
+            median_ids,
             out_observe,
         ) = rasterize_to_pixels(
             means2d,
@@ -836,6 +837,9 @@ def rasterization(
 
         # Multi-view observe-trim per-Gaussian counter (0-size unless count_observe).
         meta["out_observe"] = out_observe
+        # Per-pixel intersection index of the median-crossing splat (map through
+        # meta["flatten_ids"] to recover the owning Gaussian id).
+        meta["out_median_ids"] = median_ids
 
         # Median-primary modes (opacity-volume median and its reciprocal variant)
         # put the level-set depth in ch3 and the expected depth in ch4.

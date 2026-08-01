@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import numpy as np
 from typing import Callable, Dict, List, Union
 
@@ -123,6 +124,71 @@ def duplicate(
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         return torch.nn.Parameter(torch.cat([p, p[sel]]), requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device)])
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = torch.cat((v, v[sel]))
+
+
+@torch.no_grad()
+def clone_flipped(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    offset: float = 0.1,
+    maintain_volume: bool = True,
+):
+    """Inplace clone masked Gaussians as back-facing twins along their normal.
+
+    Each selected Gaussian is turned into a straddling pair centered on its
+    original position: the original is nudged to ``mu + offset * thickness * n``
+    and a clone is added at ``mu - offset * thickness * n`` with the sign channel
+    of its oriented normal ``[dir(3), sign(1)]`` negated (a back-facing twin).
+    Here ``n`` is the unit oriented normal and ``thickness`` is the shortest scale
+    axis. When ``maintain_volume`` is set, both members' log-scales are reduced so
+    the pair preserves the original ellipsoid volume. Requires a ``normals`` param.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to clone the Gaussians.
+        offset: Straddle distance as a fraction of the normal-axis thickness.
+        maintain_volume: Whether to shrink log-scales to preserve total volume.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+
+    # Unit oriented normal and normal-axis thickness of the selected Gaussians.
+    raw = params["normals"][sel]  # [K, 4]
+    n = F.normalize(raw[:, 0:3], dim=-1) * torch.tanh(raw[:, 3:4])  # [K, 3]
+    thickness = torch.exp(params["scales"][sel]).min(dim=-1, keepdim=True).values  # [K, 1]
+    shift = offset * thickness * n  # [K, 3]
+    # Two members share the original volume -> each scale factor (1/2)^(1/3).
+    log_shrink = math.log(2.0) / 3.0 if maintain_volume else 0.0
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "means":
+            moved = p.clone()
+            moved[sel] = p[sel] + shift
+            p_new = torch.cat([moved, p[sel] - shift])
+        elif name == "normals":
+            twin = p[sel].clone()
+            twin[:, 3] = -twin[:, 3]  # flip oriented normal via its sign channel
+            p_new = torch.cat([p, twin])
+        elif name == "scales":
+            shrunk = p.clone()
+            shrunk[sel] = p[sel] - log_shrink
+            p_new = torch.cat([shrunk, shrunk[sel]])
+        else:
+            p_new = torch.cat([p, p[sel]])
+        return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
         return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device)])
